@@ -1,6 +1,5 @@
 import { Router, Request, Response } from 'express';
-import crypto from 'crypto';
-import { db } from '../db.js';
+import { usersRepo, eventsRepo } from '../db.js';
 import { logger } from '../logger.js';
 import {
   hashPassword,
@@ -15,6 +14,21 @@ import {
 } from '../auth.js';
 
 const router = Router();
+
+function publicUser(u: {
+  id: string; email: string; is_onboarded: boolean; is_admin: boolean;
+  native_language: string; timezone: string; active_language_profile_id: string | null;
+}) {
+  return {
+    id: u.id,
+    email: u.email,
+    is_onboarded: u.is_onboarded,
+    is_admin: u.is_admin,
+    native_language: u.native_language,
+    timezone: u.timezone,
+    active_language_profile_id: u.active_language_profile_id,
+  };
+}
 
 // POST /auth/register
 router.post('/register', async (req: Request, res: Response) => {
@@ -45,62 +59,52 @@ router.post('/register', async (req: Request, res: Response) => {
     return;
   }
 
-  const existing = db.tables.users.find(u => u.email === cleanEmail);
-  if (existing) {
-    logger.warn('AUTH', 'Registration conflict - email already registered', { email: cleanEmail });
-    res.status(409).json({
-      error: { code: 'email_taken', message: 'Этот email уже зарегистрирован' },
+  try {
+    const existing = await usersRepo.findByEmail(cleanEmail);
+    if (existing) {
+      logger.warn('AUTH', 'Registration conflict - email already registered', { email: cleanEmail });
+      res.status(409).json({
+        error: { code: 'email_taken', message: 'Этот email уже зарегистрирован' },
+      });
+      return;
+    }
+
+    const password_hash = await hashPassword(password);
+    const isFirstUser = (await usersRepo.count()) === 0;
+
+    const newUser = await usersRepo.create({
+      email: cleanEmail,
+      password_hash,
+      native_language: 'ru',
+      timezone: 'Europe/Moscow',
+      timezone_changed_at: null,
+      is_onboarded: false,
+      is_admin: isFirstUser, // First registered user is automatically admin
+      active_language_profile_id: null,
     });
-    return;
-  }
 
-  const password_hash = await hashPassword(password);
-  const isFirstUser = db.tables.users.length === 0;
+    eventsRepo.record(newUser.id, 'signup', { email: cleanEmail });
 
-  const newUser = {
-    id: crypto.randomUUID(),
-    email: cleanEmail,
-    password_hash,
-    native_language: 'ru',
-    timezone: 'Europe/Moscow',
-    timezone_changed_at: null,
-    is_onboarded: false,
-    is_admin: isFirstUser, // First registered user is automatically admin
-    active_language_profile_id: null,
-    created_at: new Date().toISOString(),
-  };
-
-  db.tables.users.push(newUser);
-  db.save();
-  db.recordEvent(newUser.id, 'signup', { email: cleanEmail });
-
-  logger.success('AUTH', 'User registered successfully', {
-    userId: newUser.id,
-    email: newUser.email,
-    isAdmin: newUser.is_admin,
-  });
-
-  const { token: refreshToken } = createRefreshToken(newUser.id);
-  setRefreshTokenCookie(res, refreshToken);
-
-  const accessToken = generateAccessToken({
-    userId: newUser.id,
-    email: newUser.email,
-    isAdmin: newUser.is_admin,
-  });
-
-  res.json({
-    access_token: accessToken,
-    user: {
-      id: newUser.id,
+    logger.success('AUTH', 'User registered successfully', {
+      userId: newUser.id,
       email: newUser.email,
-      is_onboarded: newUser.is_onboarded,
-      is_admin: newUser.is_admin,
-      native_language: newUser.native_language,
-      timezone: newUser.timezone,
-      active_language_profile_id: newUser.active_language_profile_id,
-    },
-  });
+      isAdmin: newUser.is_admin,
+    });
+
+    const { token: refreshToken } = await createRefreshToken(newUser.id);
+    setRefreshTokenCookie(res, refreshToken);
+
+    const accessToken = generateAccessToken({
+      userId: newUser.id,
+      email: newUser.email,
+      isAdmin: newUser.is_admin,
+    });
+
+    res.json({ access_token: accessToken, user: publicUser(newUser) });
+  } catch (err: any) {
+    logger.error('AUTH', 'Registration DB error', { message: err.message });
+    res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
+  }
 });
 
 // POST /auth/login
@@ -114,55 +118,46 @@ router.post('/login', async (req: Request, res: Response) => {
     return;
   }
 
-  const cleanEmail = String(email).trim().toLowerCase();
-  const user = db.tables.users.find(u => u.email === cleanEmail);
-  if (!user) {
-    logger.warn('AUTH', 'Login failed - user not found', { email: cleanEmail });
-    res.status(401).json({
-      error: { code: 'invalid_credentials', message: 'Неверный email или пароль' },
-    });
-    return;
-  }
+  try {
+    const cleanEmail = String(email).trim().toLowerCase();
+    const user = await usersRepo.findByEmail(cleanEmail);
+    if (!user) {
+      logger.warn('AUTH', 'Login failed - user not found', { email: cleanEmail });
+      res.status(401).json({
+        error: { code: 'invalid_credentials', message: 'Неверный email или пароль' },
+      });
+      return;
+    }
 
-  const isValid = await comparePassword(password, user.password_hash);
-  if (!isValid) {
-    logger.warn('AUTH', 'Login failed - invalid password', { email: cleanEmail });
-    res.status(401).json({
-      error: { code: 'invalid_credentials', message: 'Неверный email или пароль' },
-    });
-    return;
-  }
+    const isValid = await comparePassword(password, user.password_hash);
+    if (!isValid) {
+      logger.warn('AUTH', 'Login failed - invalid password', { email: cleanEmail });
+      res.status(401).json({
+        error: { code: 'invalid_credentials', message: 'Неверный email или пароль' },
+      });
+      return;
+    }
 
-  const { token: refreshToken } = createRefreshToken(user.id);
-  setRefreshTokenCookie(res, refreshToken);
+    const { token: refreshToken } = await createRefreshToken(user.id);
+    setRefreshTokenCookie(res, refreshToken);
 
-  const accessToken = generateAccessToken({
-    userId: user.id,
-    email: user.email,
-    isAdmin: user.is_admin,
-  });
-
-  logger.success('AUTH', 'User logged in', {
-    userId: user.id,
-    email: user.email,
-  });
-
-  res.json({
-    access_token: accessToken,
-    user: {
-      id: user.id,
+    const accessToken = generateAccessToken({
+      userId: user.id,
       email: user.email,
-      is_onboarded: user.is_onboarded,
-      is_admin: user.is_admin,
-      native_language: user.native_language,
-      timezone: user.timezone,
-      active_language_profile_id: user.active_language_profile_id,
-    },
-  });
+      isAdmin: user.is_admin,
+    });
+
+    logger.success('AUTH', 'User logged in', { userId: user.id, email: user.email });
+
+    res.json({ access_token: accessToken, user: publicUser(user) });
+  } catch (err: any) {
+    logger.error('AUTH', 'Login DB error', { message: err.message });
+    res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
+  }
 });
 
 // POST /auth/refresh
-router.post('/refresh', (req: Request, res: Response) => {
+router.post('/refresh', async (req: Request, res: Response) => {
   const oldRefreshToken = req.cookies?.refreshToken || req.body?.refresh_token;
   if (!oldRefreshToken) {
     logger.debug('AUTH', 'Refresh failed - no token provided');
@@ -172,38 +167,36 @@ router.post('/refresh', (req: Request, res: Response) => {
     return;
   }
 
-  const rotation = rotateRefreshToken(oldRefreshToken);
-  if (!rotation) {
-    logger.warn('AUTH', 'Refresh failed - token expired or revoked');
-    res.clearCookie('refreshToken');
-    res.status(401).json({
-      error: { code: 'unauthorized', message: 'Сессия истекла или токен отозван' },
-    });
-    return;
-  }
+  try {
+    const rotation = await rotateRefreshToken(oldRefreshToken);
+    if (!rotation) {
+      logger.warn('AUTH', 'Refresh failed - token expired or revoked');
+      res.clearCookie('refreshToken');
+      res.status(401).json({
+        error: { code: 'unauthorized', message: 'Сессия истекла или токен отозван' },
+      });
+      return;
+    }
 
-  logger.info('AUTH', 'Token refreshed successfully', { userId: rotation.user.id });
-  setRefreshTokenCookie(res, rotation.newRefreshToken);
-  res.json({
-    access_token: rotation.accessToken,
-    user: {
-      id: rotation.user.id,
-      email: rotation.user.email,
-      is_onboarded: rotation.user.is_onboarded,
-      is_admin: rotation.user.is_admin,
-      native_language: rotation.user.native_language,
-      timezone: rotation.user.timezone,
-      active_language_profile_id: rotation.user.active_language_profile_id,
-    },
-  });
+    logger.info('AUTH', 'Token refreshed successfully', { userId: rotation.user.id });
+    setRefreshTokenCookie(res, rotation.newRefreshToken);
+    res.json({ access_token: rotation.accessToken, user: publicUser(rotation.user) });
+  } catch (err: any) {
+    logger.error('AUTH', 'Refresh DB error', { message: err.message });
+    res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
+  }
 });
 
 // POST /auth/logout
-router.post('/logout', (req: Request, res: Response) => {
+router.post('/logout', async (req: Request, res: Response) => {
   const token = req.cookies?.refreshToken;
   if (token) {
-    revokeRefreshToken(token);
-    logger.info('AUTH', 'User logged out and token revoked');
+    try {
+      await revokeRefreshToken(token);
+      logger.info('AUTH', 'User logged out and token revoked');
+    } catch (err: any) {
+      logger.error('AUTH', 'Logout DB error', { message: err.message });
+    }
   }
   res.clearCookie('refreshToken');
   res.json({ success: true });
@@ -213,17 +206,7 @@ router.post('/logout', (req: Request, res: Response) => {
 router.get('/me', authenticate, (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   logger.debug('AUTH', 'Current user session verified', { userId: user.id });
-  res.json({
-    user: {
-      id: user.id,
-      email: user.email,
-      is_onboarded: user.is_onboarded,
-      is_admin: user.is_admin,
-      native_language: user.native_language,
-      timezone: user.timezone,
-      active_language_profile_id: user.active_language_profile_id,
-    },
-  });
+  res.json({ user: publicUser(user) });
 });
 
 export default router;

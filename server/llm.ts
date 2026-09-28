@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import crypto from 'crypto';
-import { db } from './db.js';
+import { llmCallsRepo } from './db.js';
 import { logger } from './logger.js';
 
 const ai = new GoogleGenAI({
@@ -203,7 +203,7 @@ export async function generateLessonSentences(
     latencyMs: latency,
     sentences: parsedOutput.map(p => p.sentence),
   });
-  db.recordLlmCall({
+  llmCallsRepo.record({
     purpose: 'generate',
     user_id: userId || null,
     language_profile_id: profileId || null,
@@ -328,7 +328,7 @@ new_suggested_words: до 3 слов из целевого предложени�
     evaluations: parsedOutput.evaluations.map(e => ({ word_id: e.word_id, result: e.result, fragment: e.user_fragment })),
     suggestedWords: parsedOutput.new_suggested_words.map(s => s.lemma),
   });
-  db.recordLlmCall({
+  llmCallsRepo.record({
     purpose: 'evaluate',
     user_id: userId || null,
     language_profile_id: profileId || null,

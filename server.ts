@@ -6,6 +6,8 @@ import { createServer as createViteServer } from 'vite';
 import pg from 'pg';
 
 import { logger } from './server/logger.js';
+import { initDatabase } from './server/db.js';
+import { closePool } from './server/pg.js';
 import authRoutes from './server/routes/auth.routes.js';
 import onboardingRoutes from './server/routes/onboarding.routes.js';
 import languagesRoutes from './server/routes/languages.routes.js';
@@ -60,6 +62,13 @@ async function checkPostgresConnection(): Promise<void> {
 }
 
 async function bootstrap() {
+  // Проверка доступности PostgreSQL и корректности схемы (или остановка с ошибкой)
+  if (process.env.CHECK_DB_ON_STARTUP !== 'false') {
+    await initDatabase();
+  } else {
+    logger.warn('DB', 'CHECK_DB_ON_STARTUP=false — проверка БД при старте пропущена');
+  }
+
   if (!isProduction) {
     await checkPostgresConnection();
   }
@@ -144,9 +153,24 @@ async function bootstrap() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
+
+  // Graceful shutdown: закрываем HTTP-сервер и пул соединений с PostgreSQL
+  const shutdown = async (signal: string) => {
+    logger.info('SERVER', `Получен ${signal} — остановка сервера...`);
+    server.close();
+    try {
+      await closePool();
+      logger.success('SERVER', 'Пул соединений с PostgreSQL закрыт');
+    } catch (err: any) {
+      logger.error('SERVER', 'Ошибка при закрытии пула PostgreSQL', { message: err.message });
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
 bootstrap().catch(err => {

@@ -1,41 +1,45 @@
 import { Router, Response } from 'express';
-import crypto from 'crypto';
-import { db } from '../db.js';
+import {
+  usersRepo, dictionariesRepo, languagesRepo, profilesRepo, eventsRepo,
+} from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { logger } from '../logger.js';
 
 const router = Router();
 
 // GET /languages/pairs?native=ru
-router.get('/pairs', (req, res: Response) => {
+router.get('/pairs', async (req, res: Response) => {
   const native = String(req.query.native || 'ru');
-  const generalDicts = db.tables.dictionaries.filter(
-    d => d.native_language === native && d.is_general
-  );
+  try {
+    const generalDicts = (await dictionariesRepo.all()).filter(
+      d => d.native_language === native && d.is_general
+    );
+    const languages = await languagesRepo.all();
 
-  const supportedTargets = generalDicts.map(d => {
-    const lang = db.tables.languages.find(l => l.code === d.target_language);
-    return {
-      code: d.target_language,
-      name: lang ? lang.name : d.target_language,
-      dictionary_id: d.id,
-      dictionary_name: d.name,
-    };
-  });
+    const supportedTargets = generalDicts.map(d => {
+      const lang = languages.find(l => l.code === d.target_language);
+      return {
+        code: d.target_language,
+        name: lang ? lang.name : d.target_language,
+        dictionary_id: d.id,
+        dictionary_name: d.name,
+      };
+    });
 
-  logger.info('ONBOARDING', `Language pairs retrieved for native language "${native}"`, {
-    pairsCount: supportedTargets.length,
-    languages: supportedTargets.map(p => p.code),
-  });
+    logger.info('ONBOARDING', `Language pairs retrieved for native language "${native}"`, {
+      pairsCount: supportedTargets.length,
+      languages: supportedTargets.map(p => p.code),
+    });
 
-  res.json({
-    native_language: native,
-    pairs: supportedTargets,
-  });
+    res.json({ native_language: native, pairs: supportedTargets });
+  } catch (err: any) {
+    logger.error('ONBOARDING', 'DB error loading language pairs', { message: err.message });
+    res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
+  }
 });
 
 // POST /onboarding/complete
-router.post('/complete', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.post('/complete', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   if (user.is_onboarded) {
     logger.warn('ONBOARDING', 'User attempted duplicate onboarding', { userId: user.id });
@@ -70,72 +74,71 @@ router.post('/complete', authenticate, (req: AuthenticatedRequest, res: Response
     return;
   }
 
-  // Find general dictionary for this pair
-  const generalDict = db.tables.dictionaries.find(
-    d => d.native_language === native_language && d.target_language === target_language && d.is_general
-  );
+  try {
+    // Find general dictionary for this pair
+    const generalDict = await dictionariesRepo.findGeneralPair(native_language, target_language);
+    if (!generalDict) {
+      logger.warn('ONBOARDING', 'No general dictionary for language pair', { native_language, target_language });
+      res.status(422).json({
+        error: { code: 'pair_not_supported', message: 'Для данной пары языков нет общего словаря' },
+      });
+      return;
+    }
 
-  if (!generalDict) {
-    logger.warn('ONBOARDING', 'No general dictionary for language pair', { native_language, target_language });
-    res.status(422).json({
-      error: { code: 'pair_not_supported', message: 'Для данной пары языков нет общего словаря' },
+    const tz = timezone || 'Europe/Moscow';
+
+    // Create language profile
+    const newProfile = await profilesRepo.create({
+      user_id: user.id,
+      target_language,
+      level,
+      dictionary_id: generalDict.id,
+      daily_lesson_limit: 1,
+      last_lesson_number: 0,
     });
-    return;
-  }
 
-  // Check timezone
-  const tz = timezone || 'Europe/Moscow';
+    // Update user
+    const updatedUser = await usersRepo.update(user.id, {
+      native_language,
+      timezone: tz,
+      is_onboarded: true,
+      active_language_profile_id: newProfile.id,
+    });
 
-  // Create language profile
-  const profileId = crypto.randomUUID();
-  const newProfile = {
-    id: profileId,
-    user_id: user.id,
-    target_language,
-    level,
-    dictionary_id: generalDict.id,
-    daily_lesson_limit: 1,
-    last_lesson_number: 0,
-    created_at: new Date().toISOString(),
-  };
+    if (updatedUser) Object.assign(user, updatedUser);
 
-  db.tables.user_language_profiles.push(newProfile);
-
-  // Update user
-  user.native_language = native_language;
-  user.timezone = tz;
-  user.is_onboarded = true;
-  user.active_language_profile_id = profileId;
-  db.save();
-
-  logger.success('ONBOARDING', `Onboarding completed successfully!`, {
-    userId: user.id,
-    email: user.email,
-    targetLanguage: target_language,
-    level,
-    timezone: tz,
-    dictionaryId: generalDict.id,
-  });
-
-  db.recordEvent(user.id, 'onboarding_completed', {
-    target_language,
-    level,
-    dictionary_id: generalDict.id,
-  });
-
-  res.json({
-    success: true,
-    user: {
-      id: user.id,
+    logger.success('ONBOARDING', `Onboarding completed successfully!`, {
+      userId: user.id,
       email: user.email,
-      is_onboarded: user.is_onboarded,
-      is_admin: user.is_admin,
-      native_language: user.native_language,
-      timezone: user.timezone,
-      active_language_profile_id: user.active_language_profile_id,
-    },
-    profile: newProfile,
-  });
+      targetLanguage: target_language,
+      level,
+      timezone: tz,
+      dictionaryId: generalDict.id,
+    });
+
+    eventsRepo.record(user.id, 'onboarding_completed', {
+      target_language,
+      level,
+      dictionary_id: generalDict.id,
+    });
+
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        is_onboarded: true,
+        is_admin: user.is_admin,
+        native_language,
+        timezone: tz,
+        active_language_profile_id: newProfile.id,
+      },
+      profile: newProfile,
+    });
+  } catch (err: any) {
+    logger.error('ONBOARDING', 'DB error completing onboarding', { message: err.message });
+    res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
+  }
 });
 
 export default router;

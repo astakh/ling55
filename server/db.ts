@@ -1,6 +1,14 @@
-import fs from 'fs';
-import path from 'path';
+/**
+ * Слой доступа к данным: PostgreSQL (удалённый сервер).
+ * Все операции выполняются SQL-запросами через пул соединений (server/pg.ts).
+ * Интерфейсы строк соответствуют схеме scripts/sql/01_schema.sql.
+ */
 import crypto from 'crypto';
+import { query, queryOne, exec, withTransaction } from './pg.js';
+
+// ----------------------------------------------------------------------------
+// Типы строк (camelCase не используется — как в колонках БД)
+// ----------------------------------------------------------------------------
 
 export interface User {
   id: string;
@@ -48,20 +56,15 @@ export interface Word {
   lemma: string;
   lemma_key: string;
   pos: string;
-  level: string | null; // A1, A2, B1, B2, C1, C2
+  level: string | null;
   translations: string[];
-}
-
-export interface DictionaryWord {
-  dictionary_id: string;
-  word_id: string;
 }
 
 export interface UserLanguageProfile {
   id: string;
   user_id: string;
   target_language: string;
-  level: string; // A1, A2, B1, B2
+  level: string;
   dictionary_id: string;
   daily_lesson_limit: number;
   last_lesson_number: number;
@@ -136,24 +139,6 @@ export interface SentenceReport {
   created_at: string;
 }
 
-export interface LlmCall {
-  id: string;
-  purpose: 'generate' | 'evaluate';
-  user_id: string | null;
-  language_profile_id: string | null;
-  lesson_id: string | null;
-  exercise_id: string | null;
-  attempt: number;
-  request: any;
-  response: any;
-  status: 'ok' | 'http_error' | 'timeout' | 'invalid_json' | 'invalid_schema' | 'validation_failed';
-  http_status: number | null;
-  latency_ms: number;
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  created_at: string;
-}
-
 export interface EventLog {
   id: string;
   user_id: string;
@@ -168,332 +153,774 @@ export interface DictionaryImport {
   file_name: string;
   sha256: string;
   dictionary_id: string;
-  counters: {
-    added: number;
-    linked: number;
-    skipped: number;
-    errors: number;
-  };
+  counters: { added: number; linked: number; skipped: number; errors: number };
   dry_run: boolean;
   created_at: string;
 }
 
-export interface DatabaseSchema {
-  users: User[];
-  refresh_tokens: RefreshToken[];
-  languages: Language[];
-  dictionaries: Dictionary[];
-  words: Word[];
-  dictionary_words: DictionaryWord[];
-  user_language_profiles: UserLanguageProfile[];
-  user_words: UserWord[];
-  lessons: Lesson[];
-  lesson_exercises: LessonExercise[];
-  lesson_exercise_words: LessonExerciseWord[];
-  lesson_exercise_suggestions: LessonExerciseSuggestion[];
-  sentence_reports: SentenceReport[];
-  llm_calls: LlmCall[];
-  events: EventLog[];
-  dictionary_imports: DictionaryImport[];
-}
+const nowIso = () => new Date().toISOString();
 
-const DB_DIR = path.resolve(process.cwd(), 'data');
-const DB_FILE = path.join(DB_DIR, 'db.json');
+// ----------------------------------------------------------------------------
+// Users
+// ----------------------------------------------------------------------------
 
-// In-memory locks for profile lesson generation (pg_try_advisory_lock emulation)
-const profileLocks = new Set<string>();
-
-export class Database {
-  private data: DatabaseSchema;
-  private saveTimeout: NodeJS.Timeout | null = null;
-
-  constructor() {
-    this.data = this.load();
-    this.seedIfNeeded();
-  }
-
-  private load(): DatabaseSchema {
-    if (!fs.existsSync(DB_DIR)) {
-      fs.mkdirSync(DB_DIR, { recursive: true });
+export const usersRepo = {
+  findByEmail(email: string): Promise<User | null> {
+    return queryOne<User>('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+  },
+  findById(id: string): Promise<User | null> {
+    return queryOne<User>('SELECT * FROM users WHERE id = $1', [id]);
+  },
+  count(): Promise<number> {
+    return queryOne<{ c: string }>('SELECT COUNT(*)::text AS c FROM users').then(r => Number(r?.c ?? 0));
+  },
+  create(u: Omit<User, 'id' | 'created_at'> & { id?: string }): Promise<User> {
+    return queryOne<User>(
+      `INSERT INTO users (id, email, password_hash, native_language, timezone, timezone_changed_at,
+                          is_onboarded, is_admin, active_language_profile_id)
+       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [
+        u.id ?? null, u.email, u.password_hash, u.native_language, u.timezone,
+        u.timezone_changed_at, u.is_onboarded, u.is_admin, u.active_language_profile_id,
+      ]
+    ).then(r => r!);
+  },
+  update(id: string, patch: Partial<Omit<User, 'id' | 'email'>>): Promise<User | null> {
+    const cols: string[] = [];
+    const vals: any[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      if (k === 'id' || k === 'email') continue;
+      cols.push(`${k} = $${vals.length + 1}`);
+      vals.push(v);
     }
-    if (fs.existsSync(DB_FILE)) {
-      try {
-        const raw = fs.readFileSync(DB_FILE, 'utf-8');
-        return JSON.parse(raw);
-      } catch (e) {
-        console.error('Error loading db.json, creating new database', e);
-      }
-    }
-    return {
-      users: [],
-      refresh_tokens: [],
-      languages: [],
-      dictionaries: [],
-      words: [],
-      dictionary_words: [],
-      user_language_profiles: [],
-      user_words: [],
-      lessons: [],
-      lesson_exercises: [],
-      lesson_exercise_words: [],
-      lesson_exercise_suggestions: [],
-      sentence_reports: [],
-      llm_calls: [],
-      events: [],
-      dictionary_imports: [],
-    };
-  }
-
-  public save() {
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout);
-    }
-    this.saveTimeout = setTimeout(() => {
-      try {
-        if (!fs.existsSync(DB_DIR)) {
-          fs.mkdirSync(DB_DIR, { recursive: true });
-        }
-        fs.writeFileSync(DB_FILE, JSON.stringify(this.data, null, 2), 'utf-8');
-      } catch (err) {
-        console.error('Failed to save db.json', err);
-      }
-    }, 50);
-  }
-
-  public saveSync() {
-    try {
-      if (!fs.existsSync(DB_DIR)) {
-        fs.mkdirSync(DB_DIR, { recursive: true });
-      }
-      fs.writeFileSync(DB_FILE, JSON.stringify(this.data, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('Failed to save db.json synchronously', err);
-    }
-  }
-
-  public get tables(): DatabaseSchema {
-    return this.data;
-  }
-
-  public tryLockProfile(profileId: string): boolean {
-    if (profileLocks.has(profileId)) {
-      return false;
-    }
-    profileLocks.add(profileId);
-    return true;
-  }
-
-  public unlockProfile(profileId: string): void {
-    profileLocks.delete(profileId);
-  }
-
-  public recordEvent(userId: string, type: string, payload: any = {}) {
-    this.data.events.push({
-      id: crypto.randomUUID(),
-      user_id: userId,
-      type,
-      payload,
-      created_at: new Date().toISOString(),
-    });
-    this.save();
-  }
-
-  public recordLlmCall(call: Omit<LlmCall, 'id' | 'created_at'>) {
-    this.data.llm_calls.push({
-      ...call,
-      id: crypto.randomUUID(),
-      created_at: new Date().toISOString(),
-    });
-    this.save();
-  }
-
-  private seedIfNeeded() {
-    // Seed languages
-    if (this.data.languages.length === 0) {
-      this.data.languages = [
-        { code: 'en', name: 'Английский', is_supported: true },
-        { code: 'de', name: 'Немецкий', is_supported: true },
-        { code: 'es', name: 'Испанский', is_supported: true },
-        { code: 'fr', name: 'Французский', is_supported: true },
-      ];
-    }
-
-    // Seed General Dictionaries if empty
-    if (this.data.dictionaries.length === 0) {
-      const enDictId = crypto.randomUUID();
-      const enItDictId = crypto.randomUUID();
-      const deDictId = crypto.randomUUID();
-      const esDictId = crypto.randomUUID();
-      const frDictId = crypto.randomUUID();
-
-      this.data.dictionaries.push(
-        {
-          id: enDictId,
-          code: 'general-en-ru',
-          name: 'Общий словарь (EN → RU)',
-          description: 'Базовый словарь общего назначения по уровням A1–B2',
-          target_language: 'en',
-          native_language: 'ru',
-          is_general: true,
-        },
-        {
-          id: enItDictId,
-          code: 'it-en-ru',
-          name: 'IT и разработка (EN → RU)',
-          description: 'Термины из области программирования, серверов и DevOps',
-          target_language: 'en',
-          native_language: 'ru',
-          is_general: false,
-        },
-        {
-          id: deDictId,
-          code: 'general-de-ru',
-          name: 'Общий словарь (DE → RU)',
-          description: 'Базовый немецкий словарь A1–A2',
-          target_language: 'de',
-          native_language: 'ru',
-          is_general: true,
-        },
-        {
-          id: esDictId,
-          code: 'general-es-ru',
-          name: 'Общий словарь (ES → RU)',
-          description: 'Базовый испанский словарь A1–A2',
-          target_language: 'es',
-          native_language: 'ru',
-          is_general: true,
-        },
-        {
-          id: frDictId,
-          code: 'general-fr-ru',
-          name: 'Общий словарь (FR → RU)',
-          description: 'Базовый французский словарь A1–A2',
-          target_language: 'fr',
-          native_language: 'ru',
-          is_general: true,
-        }
+    if (cols.length === 0) return this.findById(id);
+    vals.push(id);
+    return queryOne<User>(`UPDATE users SET ${cols.join(', ')} WHERE id = $${vals.length} RETURNING *`, vals);
+  },
+  setActiveProfile(id: string, profileId: string | null): Promise<User | null> {
+    return queryOne<User>(
+      'UPDATE users SET active_language_profile_id = $2 WHERE id = $1 RETURNING *',
+      [id, profileId]
+    );
+  },
+  listAll(q?: string): Promise<User[]> {
+    if (q) {
+      return query<User>(
+        'SELECT * FROM users WHERE LOWER(email) LIKE $1 ORDER BY created_at DESC',
+        [`%${q.toLowerCase()}%`]
       );
-
-      // Seed core words
-      const rawWords: Array<{
-        target: string;
-        native: string;
-        lemma: string;
-        pos: string;
-        level: string | null;
-        translations: string[];
-        dicts: string[];
-      }> = [
-        // English A1
-        { target: 'en', native: 'ru', lemma: 'apple', pos: 'noun', level: 'A1', translations: ['яблоко'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'book', pos: 'noun', level: 'A1', translations: ['книга'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'city', pos: 'noun', level: 'A1', translations: ['город'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'friend', pos: 'noun', level: 'A1', translations: ['друг', 'подруга'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'water', pos: 'noun', level: 'A1', translations: ['вода'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'house', pos: 'noun', level: 'A1', translations: ['дом'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'read', pos: 'verb', level: 'A1', translations: ['читать'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'write', pos: 'verb', level: 'A1', translations: ['писать'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'speak', pos: 'verb', level: 'A1', translations: ['говорить', 'разговаривать'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'listen', pos: 'verb', level: 'A1', translations: ['слушать'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'good', pos: 'adj', level: 'A1', translations: ['хороший', 'добрый'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'small', pos: 'adj', level: 'A1', translations: ['маленький', 'небольшой'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'fast', pos: 'adv', level: 'A1', translations: ['быстро'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'today', pos: 'adv', level: 'A1', translations: ['сегодня'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'always', pos: 'adv', level: 'A1', translations: ['всегда'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'under', pos: 'prep', level: 'A1', translations: ['под'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'with', pos: 'prep', level: 'A1', translations: ['с', 'вместе с'], dicts: [enDictId] },
-
-        // English A2
-        { target: 'en', native: 'ru', lemma: 'journey', pos: 'noun', level: 'A2', translations: ['путешествие', 'поездка'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'market', pos: 'noun', level: 'A2', translations: ['рынок', 'базар'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'village', pos: 'noun', level: 'A2', translations: ['деревня', 'село'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'decide', pos: 'verb', level: 'A2', translations: ['решать', 'принимать решение'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'explain', pos: 'verb', level: 'A2', translations: ['объяснять'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'remember', pos: 'verb', level: 'A2', translations: ['помнить', 'вспоминать'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'careful', pos: 'adj', level: 'A2', translations: ['осторожный', 'внимательный'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'bright', pos: 'adj', level: 'A2', translations: ['яркий', 'светлый'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'suddenly', pos: 'adv', level: 'A2', translations: ['вдруг', 'внезапно'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'already', pos: 'adv', level: 'A2', translations: ['уже'], dicts: [enDictId] },
-
-        // English B1
-        { target: 'en', native: 'ru', lemma: 'challenge', pos: 'noun', level: 'B1', translations: ['вызов', 'сложная задача'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'opportunity', pos: 'noun', level: 'B1', translations: ['возможность', 'шанс'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'achieve', pos: 'verb', level: 'B1', translations: ['достигать', 'добиваться'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'encourage', pos: 'verb', level: 'B1', translations: ['поощрять', 'подбадривать'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'reliable', pos: 'adj', level: 'B1', translations: ['надёжный'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'efficient', pos: 'adj', level: 'B1', translations: ['эффективный', 'продуктивный'], dicts: [enDictId] },
-
-        // English B2
-        { target: 'en', native: 'ru', lemma: 'ambiguity', pos: 'noun', level: 'B2', translations: ['двусмысленность', 'неопределённость'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'consequence', pos: 'noun', level: 'B2', translations: ['последствие', 'следствие'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'comprehend', pos: 'verb', level: 'B2', translations: ['постигать', 'понимать'], dicts: [enDictId] },
-        { target: 'en', native: 'ru', lemma: 'inevitable', pos: 'adj', level: 'B2', translations: ['неизбежный'], dicts: [enDictId] },
-
-        // English IT Thematic
-        { target: 'en', native: 'ru', lemma: 'deploy', pos: 'verb', level: 'B1', translations: ['развёртывать', 'выкатывать'], dicts: [enItDictId] },
-        { target: 'en', native: 'ru', lemma: 'server', pos: 'noun', level: null, translations: ['сервер'], dicts: [enItDictId] },
-        { target: 'en', native: 'ru', lemma: 'database', pos: 'noun', level: 'A2', translations: ['база данных'], dicts: [enItDictId] },
-        { target: 'en', native: 'ru', lemma: 'query', pos: 'noun', level: 'B1', translations: ['запрос'], dicts: [enItDictId] },
-        { target: 'en', native: 'ru', lemma: 'compile', pos: 'verb', level: 'B1', translations: ['компилировать', 'собирать'], dicts: [enItDictId] },
-        { target: 'en', native: 'ru', lemma: 'debug', pos: 'verb', level: 'A2', translations: ['отлаживать', 'искать ошибки'], dicts: [enItDictId] },
-        { target: 'en', native: 'ru', lemma: 'cache', pos: 'noun', level: null, translations: ['кэш', 'буфер'], dicts: [enItDictId] },
-
-        // German A1/A2
-        { target: 'de', native: 'ru', lemma: 'Haus', pos: 'noun', level: 'A1', translations: ['дом'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'Buch', pos: 'noun', level: 'A1', translations: ['книга'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'Freund', pos: 'noun', level: 'A1', translations: ['друг'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'lesen', pos: 'verb', level: 'A1', translations: ['читать'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'schreiben', pos: 'verb', level: 'A1', translations: ['писать'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'schnell', pos: 'adv', level: 'A1', translations: ['быстро'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'gut', pos: 'adj', level: 'A1', translations: ['хороший'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'arbeiten', pos: 'verb', level: 'A2', translations: ['работать'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'verstehen', pos: 'verb', level: 'A2', translations: ['понимать'], dicts: [deDictId] },
-        { target: 'de', native: 'ru', lemma: 'wichtig', pos: 'adj', level: 'A2', translations: ['важный'], dicts: [deDictId] },
-
-        // Spanish A1/A2
-        { target: 'es', native: 'ru', lemma: 'casa', pos: 'noun', level: 'A1', translations: ['дом'], dicts: [esDictId] },
-        { target: 'es', native: 'ru', lemma: 'amigo', pos: 'noun', level: 'A1', translations: ['друг'], dicts: [esDictId] },
-        { target: 'es', native: 'ru', lemma: 'leer', pos: 'verb', level: 'A1', translations: ['читать'], dicts: [esDictId] },
-        { target: 'es', native: 'ru', lemma: 'escribir', pos: 'verb', level: 'A1', translations: ['писать'], dicts: [esDictId] },
-        { target: 'es', native: 'ru', lemma: 'bueno', pos: 'adj', level: 'A1', translations: ['хороший', 'добрый'], dicts: [esDictId] },
-        { target: 'es', native: 'ru', lemma: 'rapido', pos: 'adv', level: 'A1', translations: ['быстро'], dicts: [esDictId] },
-        { target: 'es', native: 'ru', lemma: 'viajar', pos: 'verb', level: 'A2', translations: ['путешествовать'], dicts: [esDictId] },
-        { target: 'es', native: 'ru', lemma: 'entender', pos: 'verb', level: 'A2', translations: ['понимать'], dicts: [esDictId] },
-
-        // French A1/A2
-        { target: 'fr', native: 'ru', lemma: 'maison', pos: 'noun', level: 'A1', translations: ['дом'], dicts: [frDictId] },
-        { target: 'fr', native: 'ru', lemma: 'livre', pos: 'noun', level: 'A1', translations: ['книга'], dicts: [frDictId] },
-        { target: 'fr', native: 'ru', lemma: 'ami', pos: 'noun', level: 'A1', translations: ['друг'], dicts: [frDictId] },
-        { target: 'fr', native: 'ru', lemma: 'lire', pos: 'verb', level: 'A1', translations: ['читать'], dicts: [frDictId] },
-        { target: 'fr', native: 'ru', lemma: 'bon', pos: 'adj', level: 'A1', translations: ['хороший'], dicts: [frDictId] },
-        { target: 'fr', native: 'ru', lemma: 'comprendre', pos: 'verb', level: 'A2', translations: ['понимать'], dicts: [frDictId] },
-      ];
-
-      for (const w of rawWords) {
-        const lemmaKey = w.lemma.trim().normalize('NFC').toLowerCase();
-        const wordId = crypto.randomUUID();
-        this.data.words.push({
-          id: wordId,
-          target_language: w.target,
-          native_language: w.native,
-          lemma: w.lemma,
-          lemma_key: lemmaKey,
-          pos: w.pos,
-          level: w.level,
-          translations: w.translations,
-        });
-
-        for (const dictId of w.dicts) {
-          this.data.dictionary_words.push({
-            dictionary_id: dictId,
-            word_id: wordId,
-          });
-        }
-      }
     }
+    return query<User>('SELECT * FROM users ORDER BY created_at DESC');
+  },
+};
 
-    this.saveSync();
-  }
+// ----------------------------------------------------------------------------
+// Refresh tokens
+// ----------------------------------------------------------------------------
+
+export const refreshTokensRepo = {
+  create(userId: string, familyId: string, tokenHash: string, expiresAt: string): Promise<RefreshToken> {
+    return queryOne<RefreshToken>(
+      `INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [userId, familyId, tokenHash, expiresAt]
+    ).then(r => r!);
+  },
+  findByHash(tokenHash: string): Promise<RefreshToken | null> {
+    return queryOne<RefreshToken>('SELECT * FROM refresh_tokens WHERE token_hash = $1', [tokenHash]);
+  },
+  revokeFamily(familyId: string): Promise<number> {
+    return exec('UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1 AND revoked_at IS NULL', [familyId]);
+  },
+  revokeByHash(tokenHash: string): Promise<number> {
+    return exec('UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL', [tokenHash]);
+  },
+  markReplaced(oldHash: string, newHash: string): Promise<number> {
+    return exec(
+      'UPDATE refresh_tokens SET replaced_by = $2, revoked_at = now() WHERE token_hash = $1',
+      [oldHash, newHash]
+    );
+  },
+  revokeAllForUser(userId: string): Promise<number> {
+    return exec('UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
+  },
+};
+
+// ----------------------------------------------------------------------------
+// Languages / dictionaries / words
+// ----------------------------------------------------------------------------
+
+export const languagesRepo = {
+  all(): Promise<Language[]> {
+    return query<Language>('SELECT * FROM languages ORDER BY code');
+  },
+  findByCode(code: string): Promise<Language | null> {
+    return queryOne<Language>('SELECT * FROM languages WHERE code = $1', [code]);
+  },
+};
+
+export const dictionariesRepo = {
+  all(): Promise<Dictionary[]> {
+    return query<Dictionary>('SELECT * FROM dictionaries ORDER BY name');
+  },
+  findById(id: string): Promise<Dictionary | null> {
+    return queryOne<Dictionary>('SELECT * FROM dictionaries WHERE id = $1', [id]);
+  },
+  findByCode(code: string): Promise<Dictionary | null> {
+    return queryOne<Dictionary>('SELECT * FROM dictionaries WHERE code = $1', [code]);
+  },
+  findGeneralPair(native: string, target: string): Promise<Dictionary | null> {
+    return queryOne<Dictionary>(
+      'SELECT * FROM dictionaries WHERE native_language = $1 AND target_language = $2 AND is_general LIMIT 1',
+      [native, target]
+    );
+  },
+  findPair(target: string, native: string): Promise<Dictionary[]> {
+    return query<Dictionary>(
+      'SELECT * FROM dictionaries WHERE target_language = $1 AND native_language = $2 ORDER BY is_general DESC, name',
+      [target, native]
+    );
+  },
+  findPairById(id: string, target: string, native: string): Promise<Dictionary | null> {
+    return queryOne<Dictionary>(
+      'SELECT * FROM dictionaries WHERE id = $1 AND target_language = $2 AND native_language = $3',
+      [id, target, native]
+    );
+  },
+  create(d: Omit<Dictionary, 'id'>): Promise<Dictionary> {
+    return queryOne<Dictionary>(
+      `INSERT INTO dictionaries (code, name, description, target_language, native_language, is_general)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [d.code, d.name, d.description, d.target_language, d.native_language, d.is_general]
+    ).then(r => r!);
+  },
+  wordCount(dictionaryId: string): Promise<number> {
+    return queryOne<{ c: string }>(
+      'SELECT COUNT(*)::text AS c FROM dictionary_words WHERE dictionary_id = $1',
+      [dictionaryId]
+    ).then(r => Number(r?.c ?? 0));
+  },
+  wordIds(dictionaryId: string): Promise<string[]> {
+    return query<{ word_id: string }>(
+      'SELECT word_id FROM dictionary_words WHERE dictionary_id = $1',
+      [dictionaryId]
+    ).then(rows => rows.map(r => r.word_id));
+  },
+  linkWord(dictionaryId: string, wordId: string): Promise<number> {
+    return exec(
+      'INSERT INTO dictionary_words (dictionary_id, word_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [dictionaryId, wordId]
+    );
+  },
+  isWordLinked(dictionaryId: string, wordId: string): Promise<boolean> {
+    return queryOne<{ exists: boolean }>(
+      'SELECT EXISTS(SELECT 1 FROM dictionary_words WHERE dictionary_id = $1 AND word_id = $2) AS exists',
+      [dictionaryId, wordId]
+    ).then(r => Boolean(r?.exists));
+  },
+};
+
+export const wordsRepo = {
+  findById(id: string): Promise<Word | null> {
+    return queryOne<Word>('SELECT * FROM words WHERE id = $1', [id]);
+  },
+  findByIds(ids: string[]): Promise<Word[]> {
+    if (ids.length === 0) return Promise.resolve([]);
+    return query<Word>('SELECT * FROM words WHERE id = ANY($1::uuid[])', [ids]);
+  },
+  findByLemmaKey(target: string, native: string, lemmaKey: string, pos?: string): Promise<Word | null> {
+    if (pos) {
+      return queryOne<Word>(
+        'SELECT * FROM words WHERE target_language = $1 AND native_language = $2 AND lemma_key = $3 AND pos = $4 LIMIT 1',
+        [target, native, lemmaKey, pos]
+      );
+    }
+    return queryOne<Word>(
+      'SELECT * FROM words WHERE target_language = $1 AND native_language = $2 AND lemma_key = $3 LIMIT 1',
+      [target, native, lemmaKey]
+    );
+  },
+  create(w: Omit<Word, 'id'>): Promise<Word> {
+    return queryOne<Word>(
+      `INSERT INTO words (target_language, native_language, lemma, lemma_key, pos, level, translations)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) RETURNING *`,
+      [w.target_language, w.native_language, w.lemma, w.lemma_key, w.pos, w.level, JSON.stringify(w.translations)]
+    ).then(r => r!);
+  },
+  /** Кандидаты новых слов из словаря профиля (Alg 5.2 шаг 5). */
+  candidatesFromDictionary(params: {
+    dictionaryId: string;
+    excludeWordIds: string[];
+    targetLanguage: string;
+    nativeLanguage: string;
+    allowedLevels: string[];
+    isGeneral: boolean;
+  }): Promise<Word[]> {
+    return query<Word>(
+      `SELECT w.* FROM words w
+         JOIN dictionary_words dw ON dw.word_id = w.id
+        WHERE dw.dictionary_id = $1
+          AND NOT (w.id = ANY($2::uuid[]))
+          AND w.target_language = $3
+          AND w.native_language = $4
+          AND (
+            (w.level IS NOT NULL AND w.level = ANY($5::text[]))
+            OR (w.level IS NULL AND $6 = FALSE)
+          )`,
+      [
+        params.dictionaryId,
+        params.excludeWordIds,
+        params.targetLanguage,
+        params.nativeLanguage,
+        params.allowedLevels,
+        params.isGeneral,
+      ]
+    );
+  },
+};
+
+// ----------------------------------------------------------------------------
+// User language profiles
+// ----------------------------------------------------------------------------
+
+export const profilesRepo = {
+  findById(id: string): Promise<UserLanguageProfile | null> {
+    return queryOne<UserLanguageProfile>('SELECT * FROM user_language_profiles WHERE id = $1', [id]);
+  },
+  findByIdAndUser(id: string, userId: string): Promise<UserLanguageProfile | null> {
+    return queryOne<UserLanguageProfile>(
+      'SELECT * FROM user_language_profiles WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+  },
+  listByUser(userId: string): Promise<UserLanguageProfile[]> {
+    return query<UserLanguageProfile>(
+      'SELECT * FROM user_language_profiles WHERE user_id = $1 ORDER BY created_at',
+      [userId]
+    );
+  },
+  findByUserAndTarget(userId: string, target: string): Promise<UserLanguageProfile | null> {
+    return queryOne<UserLanguageProfile>(
+      'SELECT * FROM user_language_profiles WHERE user_id = $1 AND target_language = $2',
+      [userId, target]
+    );
+  },
+  create(p: Omit<UserLanguageProfile, 'id' | 'created_at'>): Promise<UserLanguageProfile> {
+    return queryOne<UserLanguageProfile>(
+      `INSERT INTO user_language_profiles
+         (user_id, target_language, level, dictionary_id, daily_lesson_limit, last_lesson_number)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [p.user_id, p.target_language, p.level, p.dictionary_id, p.daily_lesson_limit, p.last_lesson_number]
+    ).then(r => r!);
+  },
+  update(id: string, patch: Partial<Pick<UserLanguageProfile, 'level' | 'dictionary_id' | 'daily_lesson_limit' | 'last_lesson_number'>>): Promise<UserLanguageProfile | null> {
+    const cols: string[] = [];
+    const vals: any[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      cols.push(`${k} = $${vals.length + 1}`);
+      vals.push(v);
+    }
+    if (cols.length === 0) return this.findById(id);
+    vals.push(id);
+    return queryOne<UserLanguageProfile>(
+      `UPDATE user_language_profiles SET ${cols.join(', ')} WHERE id = $${vals.length} RETURNING *`,
+      vals
+    );
+  },
+};
+
+// ----------------------------------------------------------------------------
+// User words (SRS state)
+// ----------------------------------------------------------------------------
+
+export const userWordsRepo = {
+  findByProfileAndWord(profileId: string, wordId: string): Promise<UserWord | null> {
+    return queryOne<UserWord>(
+      'SELECT * FROM user_words WHERE language_profile_id = $1 AND word_id = $2',
+      [profileId, wordId]
+    );
+  },
+  listByProfile(profileId: string, status?: string): Promise<UserWord[]> {
+    if (status) {
+      return query<UserWord>(
+        'SELECT * FROM user_words WHERE language_profile_id = $1 AND status = $2',
+        [profileId, status]
+      );
+    }
+    return query<UserWord>('SELECT * FROM user_words WHERE language_profile_id = $1', [profileId]);
+  },
+  wordIdsByProfile(profileId: string): Promise<string[]> {
+    return query<{ word_id: string }>(
+      'SELECT word_id FROM user_words WHERE language_profile_id = $1',
+      [profileId]
+    ).then(rows => rows.map(r => r.word_id));
+  },
+  dueWords(profileId: string, upToLessonNumber: number): Promise<UserWord[]> {
+    return query<UserWord>(
+      `SELECT * FROM user_words
+        WHERE language_profile_id = $1 AND status = 'active'
+          AND due_lesson_number IS NOT NULL AND due_lesson_number <= $2`,
+      [profileId, upToLessonNumber]
+    );
+  },
+  statusCounts(profileId: string): Promise<{ active: number; mastered: number; ignored: number }> {
+    return queryOne<{ active: string; mastered: string; ignored: string }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'active')::text   AS active,
+         COUNT(*) FILTER (WHERE status = 'mastered')::text AS mastered,
+         COUNT(*) FILTER (WHERE status = 'ignored')::text  AS ignored
+       FROM user_words WHERE language_profile_id = $1`,
+      [profileId]
+    ).then(r => ({
+      active: Number(r?.active ?? 0),
+      mastered: Number(r?.mastered ?? 0),
+      ignored: Number(r?.ignored ?? 0),
+    }));
+  },
+  create(uw: {
+    language_profile_id: string;
+    word_id: string;
+    status: UserWord['status'];
+    stage: number;
+    due_lesson_number: number | null;
+    source: UserWord['source'];
+  }): Promise<UserWord | null> {
+    return queryOne<UserWord>(
+      `INSERT INTO user_words (language_profile_id, word_id, status, stage, due_lesson_number, source)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (language_profile_id, word_id) DO NOTHING
+       RETURNING *`,
+      [uw.language_profile_id, uw.word_id, uw.status, uw.stage, uw.due_lesson_number, uw.source]
+    );
+  },
+  updateSrs(id: string, patch: {
+    status?: UserWord['status'];
+    stage?: number;
+    due_lesson_number?: number | null;
+    last_reviewed_at?: string | null;
+  }): Promise<UserWord | null> {
+    const cols: string[] = [];
+    const vals: any[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      cols.push(`${k} = $${vals.length + 1}`);
+      vals.push(v);
+    }
+    if (cols.length === 0) return queryOne<UserWord>('SELECT * FROM user_words WHERE id = $1', [id]);
+    vals.push(id);
+    return queryOne<UserWord>(
+      `UPDATE user_words SET ${cols.join(', ')} WHERE id = $${vals.length} RETURNING *`,
+      vals
+    );
+  },
+};
+
+// ----------------------------------------------------------------------------
+// Lessons
+// ----------------------------------------------------------------------------
+
+export const lessonsRepo = {
+  findById(id: string): Promise<Lesson | null> {
+    return queryOne<Lesson>('SELECT * FROM lessons WHERE id = $1', [id]);
+  },
+  findInProgress(profileId: string): Promise<Lesson | null> {
+    return queryOne<Lesson>(
+      `SELECT * FROM lessons WHERE language_profile_id = $1 AND status = 'in_progress'
+       ORDER BY started_at DESC LIMIT 1`,
+      [profileId]
+    );
+  },
+  listByProfile(profileId: string): Promise<Lesson[]> {
+    return query<Lesson>(
+      'SELECT * FROM lessons WHERE language_profile_id = $1 ORDER BY lesson_number',
+      [profileId]
+    );
+  },
+  countStartedToday(profileId: string, localDate: string): Promise<number> {
+    return queryOne<{ c: string }>(
+      'SELECT COUNT(*)::text AS c FROM lessons WHERE language_profile_id = $1 AND started_local_date = $2',
+      [profileId, localDate]
+    ).then(r => Number(r?.c ?? 0));
+  },
+  /** Даты завершения уроков (локальные) по всем профилям пользователя. */
+  completedDatesByUser(userId: string): Promise<string[]> {
+    return query<{ completed_local_date: string }>(
+      `SELECT l.completed_local_date FROM lessons l
+         JOIN user_language_profiles p ON p.id = l.language_profile_id
+        WHERE p.user_id = $1 AND l.status = 'completed' AND l.completed_local_date IS NOT NULL`,
+      [userId]
+    ).then(rows => rows.map(r => r.completed_local_date));
+  },
+  create(l: {
+    id?: string;
+    language_profile_id: string;
+    lesson_number: number;
+    words_per_lesson: number;
+    started_local_date: string;
+  }): Promise<Lesson> {
+    return queryOne<Lesson>(
+      `INSERT INTO lessons (id, language_profile_id, lesson_number, status, words_per_lesson, started_local_date)
+       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, 'in_progress', $4, $5) RETURNING *`,
+      [l.id ?? null, l.language_profile_id, l.lesson_number, l.words_per_lesson, l.started_local_date]
+    ).then(r => r!);
+  },
+  markCompleted(id: string, completedLocalDate: string): Promise<number> {
+    return exec(
+      `UPDATE lessons SET status = 'completed', completed_at = now(), completed_local_date = $2
+       WHERE id = $1 AND status = 'in_progress'`,
+      [id, completedLocalDate]
+    );
+  },
+  markAbandoned(id: string): Promise<number> {
+    return exec(
+      `UPDATE lessons SET status = 'abandoned', abandoned_at = now()
+       WHERE id = $1 AND status = 'in_progress'`,
+      [id]
+    );
+  },
+};
+
+// ----------------------------------------------------------------------------
+// Lesson exercises
+// ----------------------------------------------------------------------------
+
+export const exercisesRepo = {
+  findById(id: string): Promise<LessonExercise | null> {
+    return queryOne<LessonExercise>('SELECT * FROM lesson_exercises WHERE id = $1', [id]);
+  },
+  listByLesson(lessonId: string): Promise<LessonExercise[]> {
+    return query<LessonExercise>(
+      'SELECT * FROM lesson_exercises WHERE lesson_id = $1 ORDER BY order_index',
+      [lessonId]
+    );
+  },
+  firstPending(lessonId: string): Promise<LessonExercise | null> {
+    return queryOne<LessonExercise>(
+      `SELECT * FROM lesson_exercises WHERE lesson_id = $1 AND status = 'pending'
+       ORDER BY order_index LIMIT 1`,
+      [lessonId]
+    );
+  },
+  listByLessons(lessonIds: string[]): Promise<LessonExercise[]> {
+    if (lessonIds.length === 0) return Promise.resolve([]);
+    return query<LessonExercise>(
+      'SELECT * FROM lesson_exercises WHERE lesson_id = ANY($1::uuid[]) ORDER BY order_index',
+      [lessonIds]
+    );
+  },
+  countPending(lessonId: string): Promise<number> {
+    return queryOne<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM lesson_exercises WHERE lesson_id = $1 AND status = 'pending'`,
+      [lessonId]
+    ).then(r => Number(r?.c ?? 0));
+  },
+  countEvaluatedByLesson(lessonId: string): Promise<{ done: number; total: number }> {
+    return queryOne<{ done: string; total: string }>(
+      `SELECT COUNT(*) FILTER (WHERE status = 'evaluated')::text AS done,
+              COUNT(*)::text AS total
+       FROM lesson_exercises WHERE lesson_id = $1`,
+      [lessonId]
+    ).then(r => ({ done: Number(r?.done ?? 0), total: Number(r?.total ?? 0) }));
+  },
+  create(e: {
+    id?: string;
+    lesson_id: string;
+    order_index: number;
+    target_sentence: string;
+    reference_translation: string;
+  }): Promise<LessonExercise> {
+    return queryOne<LessonExercise>(
+      `INSERT INTO lesson_exercises (id, lesson_id, order_index, target_sentence, reference_translation)
+       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5) RETURNING *`,
+      [e.id ?? null, e.lesson_id, e.order_index, e.target_sentence, e.reference_translation]
+    ).then(r => r!);
+  },
+  markEvaluated(id: string, userTranslation: string | null, dontKnow: boolean): Promise<LessonExercise | null> {
+    return queryOne<LessonExercise>(
+      `UPDATE lesson_exercises
+       SET user_translation = $2, dont_know = $3, status = 'evaluated', evaluated_at = now()
+       WHERE id = $1 RETURNING *`,
+      [id, userTranslation, dontKnow]
+    );
+  },
+  /** Предыдущие предложения, содержащие данные слова (для avoid_sentences). */
+  pastSentencesForWords(wordIds: string[], limit = 4): Promise<string[]> {
+    return query<{ target_sentence: string }>(
+      `SELECT DISTINCT e.target_sentence FROM lesson_exercises e
+         JOIN lesson_exercise_words ew ON ew.exercise_id = e.id
+        WHERE ew.word_id = ANY($1::uuid[])
+        LIMIT $2`,
+      [wordIds, limit]
+    ).then(rows => rows.map(r => r.target_sentence));
+  },
+};
+
+// ----------------------------------------------------------------------------
+// Lesson exercise words
+// ----------------------------------------------------------------------------
+
+export const exerciseWordsRepo = {
+  listByExercise(exerciseId: string, targetsOnly = false): Promise<LessonExerciseWord[]> {
+    if (targetsOnly) {
+      return query<LessonExerciseWord>(
+        'SELECT * FROM lesson_exercise_words WHERE exercise_id = $1 AND is_target',
+        [exerciseId]
+      );
+    }
+    return query<LessonExerciseWord>('SELECT * FROM lesson_exercise_words WHERE exercise_id = $1', [exerciseId]);
+  },
+  listByExercises(exerciseIds: string[], targetsOnly = false): Promise<LessonExerciseWord[]> {
+    if (exerciseIds.length === 0) return Promise.resolve([]);
+    const sql = targetsOnly
+      ? 'SELECT * FROM lesson_exercise_words WHERE exercise_id = ANY($1::uuid[]) AND is_target'
+      : 'SELECT * FROM lesson_exercise_words WHERE exercise_id = ANY($1::uuid[])';
+    return query<LessonExerciseWord>(sql, [exerciseIds]);
+  },
+  create(ew: {
+    exercise_id: string;
+    word_id: string;
+    is_target: boolean;
+    is_new: boolean;
+    surface_form: string | null;
+    stage_before: number | null;
+  }): Promise<LessonExerciseWord> {
+    return queryOne<LessonExerciseWord>(
+      `INSERT INTO lesson_exercise_words
+         (exercise_id, word_id, is_target, is_new, surface_form, stage_before)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [ew.exercise_id, ew.word_id, ew.is_target, ew.is_new, ew.surface_form, ew.stage_before]
+    ).then(r => r!);
+  },
+  setResult(id: string, patch: {
+    result: 'correct' | 'typo' | 'incorrect' | null;
+    user_fragment: string | null;
+    stage_before: number | null;
+    stage_after: number | null;
+  }): Promise<number> {
+    return exec(
+      `UPDATE lesson_exercise_words
+       SET result = $2, user_fragment = $3, stage_before = $4, stage_after = $5
+       WHERE id = $1`,
+      [id, patch.result, patch.user_fragment, patch.stage_before, patch.stage_after]
+    );
+  },
+  /** История употреблений слова (последние N, для карточки слова). */
+  recentByWord(wordId: string, limit = 20): Promise<Array<LessonExerciseWord & {
+    target_sentence: string; reference_translation: string; started_at: string | null; evaluated_at: string | null;
+  }>> {
+    return query(
+      `SELECT ew.*, e.target_sentence, e.reference_translation, e.evaluated_at, l.started_at
+       FROM lesson_exercise_words ew
+       JOIN lesson_exercises e ON e.id = ew.exercise_id
+       LEFT JOIN lessons l ON l.id = e.lesson_id
+       WHERE ew.word_id = $1
+       ORDER BY COALESCE(l.started_at, e.evaluated_at) DESC NULLS LAST
+       LIMIT $2`,
+      [wordId, limit]
+    );
+  },
+  /** Точность по урокам: количество target-слов с результатами и без ошибок. */
+  accuracyStatsByLessonIds(lessonIds: string[], sinceIso?: string): Promise<{ total: number; correct: number }> {
+    return queryOne<{ total: string; correct: string }>(
+      `SELECT COUNT(*)::text AS total,
+              COUNT(*) FILTER (WHERE ew.result IN ('correct','typo'))::text AS correct
+       FROM lesson_exercise_words ew
+       JOIN lesson_exercises e ON e.id = ew.exercise_id
+       WHERE ew.is_target AND ew.result IS NOT NULL
+         AND ew.exercise_id IN (SELECT id FROM lesson_exercises WHERE lesson_id = ANY($1::uuid[]))
+         AND ($2::timestamptz IS NULL OR e.evaluated_at >= $2::timestamptz)`,
+      [lessonIds, sinceIso ?? null]
+    ).then(r => ({ total: Number(r?.total ?? 0), correct: Number(r?.correct ?? 0) }));
+  },
+};
+
+// ----------------------------------------------------------------------------
+// Suggestions
+// ----------------------------------------------------------------------------
+
+export const suggestionsRepo = {
+  listByExercise(exerciseId: string): Promise<LessonExerciseSuggestion[]> {
+    return query<LessonExerciseSuggestion>(
+      'SELECT * FROM lesson_exercise_suggestions WHERE exercise_id = $1',
+      [exerciseId]
+    );
+  },
+  listByExercises(exerciseIds: string[]): Promise<LessonExerciseSuggestion[]> {
+    if (exerciseIds.length === 0) return Promise.resolve([]);
+    return query<LessonExerciseSuggestion>(
+      'SELECT * FROM lesson_exercise_suggestions WHERE exercise_id = ANY($1::uuid[])',
+      [exerciseIds]
+    );
+  },
+  create(exerciseId: string, wordId: string): Promise<LessonExerciseSuggestion | null> {
+    return queryOne<LessonExerciseSuggestion>(
+      `INSERT INTO lesson_exercise_suggestions (exercise_id, word_id, state)
+       VALUES ($1, $2, 'suggested')
+       ON CONFLICT DO NOTHING
+       RETURNING *`,
+      [exerciseId, wordId]
+    );
+  },
+  findByExerciseAndWord(exerciseId: string, wordId: string): Promise<LessonExerciseSuggestion | null> {
+    return queryOne<LessonExerciseSuggestion>(
+      'SELECT * FROM lesson_exercise_suggestions WHERE exercise_id = $1 AND word_id = $2',
+      [exerciseId, wordId]
+    );
+  },
+  setState(id: string, state: LessonExerciseSuggestion['state']): Promise<number> {
+    return exec('UPDATE lesson_exercise_suggestions SET state = $2 WHERE id = $1', [id, state]);
+  },
+  countAddedByExerciseIds(exerciseIds: string[]): Promise<number> {
+    return queryOne<{ c: string }>(
+      `SELECT COUNT(*)::text AS c FROM lesson_exercise_suggestions
+       WHERE state = 'added' AND exercise_id = ANY($1::uuid[])`,
+      [exerciseIds]
+    ).then(r => Number(r?.c ?? 0));
+  },
+};
+
+// ----------------------------------------------------------------------------
+// Sentence reports
+// ----------------------------------------------------------------------------
+
+export const reportsRepo = {
+  list(status?: string): Promise<SentenceReport[]> {
+    if (status) {
+      return query<SentenceReport>(
+        'SELECT * FROM sentence_reports WHERE status = $1 ORDER BY created_at DESC',
+        [status]
+      );
+    }
+    return query<SentenceReport>('SELECT * FROM sentence_reports ORDER BY created_at DESC');
+  },
+  findById(id: string): Promise<SentenceReport | null> {
+    return queryOne<SentenceReport>('SELECT * FROM sentence_reports WHERE id = $1', [id]);
+  },
+  findByUserAndExercise(userId: string, exerciseId: string): Promise<SentenceReport | null> {
+    return queryOne<SentenceReport>(
+      'SELECT * FROM sentence_reports WHERE user_id = $1 AND exercise_id = $2',
+      [userId, exerciseId]
+    );
+  },
+  upsert(report: { user_id: string; exercise_id: string; reason: string; comment: string | null }): Promise<SentenceReport> {
+    return queryOne<SentenceReport>(
+      `INSERT INTO sentence_reports (user_id, exercise_id, reason, comment)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, exercise_id)
+       DO UPDATE SET reason = EXCLUDED.reason, comment = EXCLUDED.comment, created_at = now()
+       RETURNING *`,
+      [report.user_id, report.exercise_id, report.reason, report.comment]
+    ).then(r => r!);
+  },
+  update(id: string, patch: { status?: string; admin_note?: string | null }): Promise<SentenceReport | null> {
+    const cols: string[] = [];
+    const vals: any[] = [];
+    for (const [k, v] of Object.entries(patch)) {
+      cols.push(`${k} = $${vals.length + 1}`);
+      vals.push(v);
+    }
+    if (cols.length === 0) return this.findById(id);
+    vals.push(id);
+    return queryOne<SentenceReport>(
+      `UPDATE sentence_reports SET ${cols.join(', ')} WHERE id = $${vals.length} RETURNING *`,
+      vals
+    );
+  },
+};
+
+// ----------------------------------------------------------------------------
+// LLM calls / events / imports
+// ----------------------------------------------------------------------------
+
+export const llmCallsRepo = {
+  record(call: {
+    purpose: 'generate' | 'evaluate';
+    user_id: string | null;
+    language_profile_id: string | null;
+    lesson_id: string | null;
+    exercise_id: string | null;
+    attempt: number;
+    request: any;
+    response: any;
+    status: string;
+    http_status: number | null;
+    latency_ms: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+  }): Promise<void> {
+    return query(
+      `INSERT INTO llm_calls
+         (purpose, user_id, language_profile_id, lesson_id, exercise_id, attempt,
+          request, response, status, http_status, latency_ms, prompt_tokens, completion_tokens)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13)`,
+      [
+        call.purpose, call.user_id, call.language_profile_id, call.lesson_id, call.exercise_id,
+        call.attempt, JSON.stringify(call.request ?? null), JSON.stringify(call.response ?? null),
+        call.status, call.http_status, call.latency_ms,
+        call.prompt_tokens ?? null, call.completion_tokens ?? null,
+      ]
+    ).then(() => undefined).catch(err => { console.error('Failed to record llm_call:', err.message); });
+  },
+};
+
+export const eventsRepo = {
+  record(userId: string, type: string, payload: any = {}): Promise<void> {
+    return query(
+      'INSERT INTO events (user_id, type, payload) VALUES ($1, $2, $3::jsonb)',
+      [userId, type, JSON.stringify(payload ?? {})]
+    ).then(() => undefined).catch(err => { console.error('Failed to record event:', err.message); });
+  },
+};
+
+export const importsRepo = {
+  record(imp: {
+    admin_id: string;
+    file_name: string;
+    sha256: string;
+    dictionary_id: string;
+    counters: DictionaryImport['counters'];
+    dry_run: boolean;
+  }): Promise<void> {
+    return query(
+      `INSERT INTO dictionary_imports (admin_id, file_name, sha256, dictionary_id, counters, dry_run)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+      [imp.admin_id, imp.file_name, imp.sha256, imp.dictionary_id, JSON.stringify(imp.counters), imp.dry_run]
+    ).then(() => undefined).catch(err => { console.error('Failed to record dictionary import:', err.message); });
+  },
+};
+
+export const userWordsRepoExt = {
+  /** Активные слова профиля с id слов (для preview). */
+  dueWithWords(profileId: string, upToLessonNumber: number): Promise<Array<UserWord & { word: Word }>> {
+    return query<UserWord & { word: Word }>(
+      `SELECT uw.*, to_jsonb(w.*) AS word FROM user_words uw
+         JOIN words w ON w.id = uw.word_id
+        WHERE uw.language_profile_id = $1 AND uw.status = 'active'
+          AND uw.due_lesson_number IS NOT NULL AND uw.due_lesson_number <= $2`,
+      [profileId, upToLessonNumber]
+    );
+  },
+};
+
+// ----------------------------------------------------------------------------
+// Совместимость: утилиты, использовавшиеся в JSON-слое
+// ----------------------------------------------------------------------------
+
+export function uuid(): string {
+  return crypto.randomUUID();
 }
 
-export const db = new Database();
+export { nowIso };
+
+/** Инициализация/проверка доступности БД при старте сервера. */
+export async function initDatabase(): Promise<void> {
+  const row = await queryOne<{ c: string }>(
+    "SELECT COUNT(*)::text AS c FROM information_schema.tables WHERE table_schema = 'public'"
+  );
+  const tables = Number(row?.c ?? 0);
+  if (tables < 16) {
+    throw new Error(
+      `Похоже, схема БД не установлена (таблиц: ${tables}). Выполните scripts/sql/create_database.sql и scripts/sql/01_schema.sql.`
+    );
+  }
+}

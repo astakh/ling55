@@ -171,7 +171,8 @@ CREATE TABLE IF NOT EXISTS lesson_exercise_suggestions (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     exercise_id UUID NOT NULL REFERENCES lesson_exercises(id) ON DELETE CASCADE,
     word_id     UUID NOT NULL REFERENCES words(id) ON DELETE CASCADE,
-    state       TEXT NOT NULL DEFAULT 'suggested' CHECK (state IN ('suggested','added','ignored'))
+    state       TEXT NOT NULL DEFAULT 'suggested' CHECK (state IN ('suggested','added','ignored')),
+    UNIQUE (exercise_id, word_id)
 );
 CREATE INDEX IF NOT EXISTS idx_suggestions_exercise ON lesson_exercise_suggestions(exercise_id);
 
@@ -184,7 +185,8 @@ CREATE TABLE IF NOT EXISTS sentence_reports (
     comment     TEXT,
     status      TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new','processed')),
     admin_note  TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, exercise_id)               -- одна жалоба пользователя на упражнение (upsert)
 );
 CREATE INDEX IF NOT EXISTS idx_reports_status ON sentence_reports(status);
 

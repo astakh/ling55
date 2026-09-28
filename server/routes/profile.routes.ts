@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import {
-  profilesRepo, userWordsRepo, lessonsRepo, exerciseWordsRepo,
+  profilesRepo, languagesRepo, userWordsRepo, lessonsRepo, exerciseWordsRepo,
 } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { getLocalDateString, calculateStreak } from '../streak.js';
@@ -46,9 +46,11 @@ router.get('/stats', authenticate, async (req: AuthenticatedRequest, res: Respon
     const accuracy30d = accuracy30dStats.total > 0
       ? Math.round((accuracy30dStats.correct / accuracy30dStats.total) * 100) : 0;
 
-    // Breakdown by language (в упрощённой версии — один профиль en)
+    // Breakdown by language
+    const languages = await languagesRepo.all();
     const languageStats = [];
     for (const p of profiles) {
+      const lang = languages.find(l => l.code === p.target_language);
       const pLessons = allLessons.filter(l => l.profileId === p.id);
       const pLessonIds = pLessons.map(l => l.id);
       const pAccuracy = await exerciseWordsRepo.accuracyStatsByLessonIds(pLessonIds);
@@ -57,7 +59,7 @@ router.get('/stats', authenticate, async (req: AuthenticatedRequest, res: Respon
       languageStats.push({
         profile_id: p.id,
         target_language: p.target_language,
-        language_name: 'Английский',
+        language_name: lang ? lang.name : p.target_language,
         level: p.level,
         words: counts,
         completed_lessons: pLessons.filter(l => l.status === 'completed').length,

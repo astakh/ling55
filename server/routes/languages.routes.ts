@@ -1,54 +1,31 @@
-/**
- * Языковые профили и словари (упрощённая версия).
- * У пользователя ровно один профиль — английский (en -> ru).
- * Пользователь сам выбирает и меняет активный словарь (общий или тематический),
- * уровень, количество слов в уроке и количество уроков в день.
- */
 import { Router, Response } from 'express';
 import {
-  profilesRepo, dictionariesRepo, userWordsRepo,
+  profilesRepo, languagesRepo, dictionariesRepo, userWordsRepo, usersRepo,
   lessonsRepo, exercisesRepo, exerciseWordsRepo, eventsRepo,
-  NATIVE_LANGUAGE, TARGET_LANGUAGE,
 } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { logger } from '../logger.js';
 
 const router = Router();
-
-const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
-const WORDS_PER_LESSON_MIN = 3;
-const WORDS_PER_LESSON_MAX = 10;
-const DAILY_LESSON_LIMIT_MIN = 1;
 const DAILY_LESSON_LIMIT_MAX = parseInt(process.env.DAILY_LESSON_LIMIT_MAX || '5', 10);
 
-function formatProfile(p: any, dict: any) {
-  return {
-    id: p.id,
-    target_language: p.target_language,
-    language_name: 'Английский',
-    level: p.level,
-    dictionary_id: p.dictionary_id,
-    dictionary_name: dict ? dict.name : '',
-    daily_lesson_limit: p.daily_lesson_limit,
-    daily_lesson_limit_max: DAILY_LESSON_LIMIT_MAX,
-    words_per_lesson: p.words_per_lesson,
-    words_per_lesson_min: WORDS_PER_LESSON_MIN,
-    words_per_lesson_max: WORDS_PER_LESSON_MAX,
-    last_lesson_number: p.last_lesson_number,
-    is_active: true,
-  };
-}
-
-// GET /language-profiles — список профилей (в упрощённой версии — один en-профиль)
+// GET /language-profiles
 router.get('/language-profiles', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   try {
     const profiles = await profilesRepo.listByUser(user.id);
+    const languages = await languagesRepo.all();
     const dicts = await dictionariesRepo.all();
 
     const formatted = profiles.map(p => {
+      const lang = languages.find(l => l.code === p.target_language);
       const dict = dicts.find(d => d.id === p.dictionary_id);
-      return formatProfile(p, dict);
+      return {
+        ...p,
+        language_name: lang ? lang.name : p.target_language,
+        dictionary_name: dict ? dict.name : '',
+        is_active: user.active_language_profile_id === p.id,
+      };
     });
 
     res.json({ profiles: formatted });
@@ -58,21 +35,80 @@ router.get('/language-profiles', authenticate, async (req: AuthenticatedRequest,
   }
 });
 
-// GET /language-profiles/current — текущий профиль (en)
-router.get('/language-profiles/current', authenticate, async (req: AuthenticatedRequest, res: Response) => {
+// POST /language-profiles (Add new language)
+router.post('/language-profiles', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
+  if (!user.is_onboarded) {
+    res.status(403).json({
+      error: { code: 'not_onboarded', message: 'Сначала завершите онбординг' },
+    });
+    return;
+  }
+
+  const { target_language, level, dictionary_id } = req.body;
+  if (!target_language || !level) {
+    res.status(422).json({
+      error: { code: 'validation_error', message: 'Язык и уровень обязательны' },
+    });
+    return;
+  }
+
+  if (target_language === user.native_language) {
+    res.status(422).json({
+      error: { code: 'same_language', message: 'Нельзя изучать родной язык' },
+    });
+    return;
+  }
+
   try {
-    const profile = await profilesRepo.findByUser(user.id);
-    if (!profile) {
-      res.status(404).json({
-        error: { code: 'profile_not_found', message: 'Профиль не найден — пройдите онбординг' },
+    const existing = await profilesRepo.findByUserAndTarget(user.id, target_language);
+    if (existing) {
+      logger.warn('LANGUAGES', 'Attempt to add already studied language', { target_language, userId: user.id });
+      res.status(409).json({
+        error: { code: 'already_exists', message: 'Этот язык уже изучается' },
       });
       return;
     }
-    const dict = await dictionariesRepo.findById(profile.dictionary_id);
-    res.json({ profile: formatProfile(profile, dict) });
+
+    let chosenDict = null;
+    if (dictionary_id) {
+      chosenDict = await dictionariesRepo.findPairById(dictionary_id, target_language, user.native_language);
+    }
+    if (!chosenDict) {
+      // Default to general dictionary
+      chosenDict = await dictionariesRepo.findGeneralPair(user.native_language, target_language);
+    }
+
+    if (!chosenDict) {
+      res.status(422).json({
+        error: { code: 'no_dictionary', message: 'Словарь для данной пары языков не найден' },
+      });
+      return;
+    }
+
+    const newProfile = await profilesRepo.create({
+      user_id: user.id,
+      target_language,
+      level,
+      dictionary_id: chosenDict.id,
+      daily_lesson_limit: 1,
+      last_lesson_number: 0,
+    });
+
+    await usersRepo.setActiveProfile(user.id, newProfile.id);
+    user.active_language_profile_id = newProfile.id;
+
+    logger.success('LANGUAGES', `New language profile added: ${target_language} (${level})`, {
+      userId: user.id,
+      profileId: newProfile.id,
+      dictionaryId: chosenDict.id,
+    });
+
+    eventsRepo.record(user.id, 'language_added', { target_language, level });
+
+    res.json({ profile: newProfile });
   } catch (err: any) {
-    logger.error('LANGUAGES', 'DB error loading current profile', { message: err.message });
+    logger.error('LANGUAGES', 'DB error creating profile', { message: err.message });
     res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
   }
 });
@@ -90,6 +126,7 @@ router.get('/language-profiles/:id', authenticate, async (req: AuthenticatedRequ
     }
 
     const dict = await dictionariesRepo.findById(profile.dictionary_id);
+    const lang = await languagesRepo.findByCode(profile.target_language);
 
     // Stats for this profile
     const wordCounts = await userWordsRepo.statusCounts(profile.id);
@@ -102,7 +139,17 @@ router.get('/language-profiles/:id', authenticate, async (req: AuthenticatedRequ
     const accPct = accuracy.total > 0 ? Math.round((accuracy.correct / accuracy.total) * 100) : 0;
 
     res.json({
-      profile: formatProfile(profile, dict),
+      profile: {
+        id: profile.id,
+        target_language: profile.target_language,
+        language_name: lang ? lang.name : profile.target_language,
+        level: profile.level,
+        dictionary_id: profile.dictionary_id,
+        dictionary_name: dict ? dict.name : '',
+        daily_lesson_limit: profile.daily_lesson_limit,
+        daily_lesson_limit_max: DAILY_LESSON_LIMIT_MAX,
+        last_lesson_number: profile.last_lesson_number,
+      },
       stats: {
         active: wordCounts.active,
         mastered: wordCounts.mastered,
@@ -118,10 +165,10 @@ router.get('/language-profiles/:id', authenticate, async (req: AuthenticatedRequ
   }
 });
 
-// PATCH /language-profiles/:id — смена уровня, активного словаря, слов в уроке, уроков в день
+// PATCH /language-profiles/:id
 router.patch('/language-profiles/:id', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
-  const { level, dictionary_id, daily_lesson_limit, words_per_lesson } = req.body;
+  const { level, dictionary_id, daily_lesson_limit } = req.body;
 
   try {
     const profile = await profilesRepo.findByIdAndUser(req.params.id, user.id);
@@ -135,7 +182,8 @@ router.patch('/language-profiles/:id', authenticate, async (req: AuthenticatedRe
     const patch: Record<string, any> = {};
 
     if (level) {
-      if (!LEVELS.includes(level)) {
+      const validLevels = ['A1', 'A2', 'B1', 'B2'];
+      if (!validLevels.includes(level)) {
         res.status(422).json({
           error: { code: 'invalid_level', message: 'Недопустимый уровень' },
         });
@@ -146,38 +194,24 @@ router.patch('/language-profiles/:id', authenticate, async (req: AuthenticatedRe
 
     if (dictionary_id) {
       const dict = await dictionariesRepo.findPairById(
-        dictionary_id, TARGET_LANGUAGE, NATIVE_LANGUAGE
+        dictionary_id, profile.target_language, user.native_language
       );
       if (!dict) {
         res.status(422).json({
-          error: { code: 'invalid_dictionary', message: 'Словарь не принадлежит паре «Английский → Русский»' },
+          error: { code: 'invalid_dictionary', message: 'Словарь не принадлежит языковой паре' },
         });
         return;
       }
       patch.dictionary_id = dictionary_id;
     }
 
-    if (words_per_lesson !== undefined) {
-      const wpl = parseInt(words_per_lesson, 10);
-      if (isNaN(wpl) || wpl < WORDS_PER_LESSON_MIN || wpl > WORDS_PER_LESSON_MAX) {
-        res.status(422).json({
-          error: {
-            code: 'invalid_words_per_lesson',
-            message: `Количество слов в уроке должно быть от ${WORDS_PER_LESSON_MIN} до ${WORDS_PER_LESSON_MAX}`,
-          },
-        });
-        return;
-      }
-      patch.words_per_lesson = wpl;
-    }
-
     if (daily_lesson_limit !== undefined) {
       const limitNum = parseInt(daily_lesson_limit, 10);
-      if (isNaN(limitNum) || limitNum < DAILY_LESSON_LIMIT_MIN || limitNum > DAILY_LESSON_LIMIT_MAX) {
+      if (isNaN(limitNum) || limitNum < 1 || limitNum > DAILY_LESSON_LIMIT_MAX) {
         res.status(422).json({
           error: {
             code: 'invalid_limit',
-            message: `Дневной лимит уроков должен быть от ${DAILY_LESSON_LIMIT_MIN} до ${DAILY_LESSON_LIMIT_MAX}`,
+            message: `Дневной лимит уроков должен быть от 1 до ${DAILY_LESSON_LIMIT_MAX}`,
           },
         });
         return;
@@ -189,46 +223,32 @@ router.patch('/language-profiles/:id', authenticate, async (req: AuthenticatedRe
       ? await profilesRepo.update(profile.id, patch)
       : profile;
 
-    if (updated && dictionary_id && dictionary_id !== profile.dictionary_id) {
-      void eventsRepo.record(user.id, 'dictionary_changed', {
-        from_dictionary_id: profile.dictionary_id,
-        to_dictionary_id: dictionary_id,
-      });
-    }
-
-    logger.info('LANGUAGES', 'Language profile updated', {
+    logger.info('LANGUAGES', `Language profile updated`, {
       userId: user.id,
       profileId: profile.id,
       level: updated?.level,
       dictionaryId: updated?.dictionary_id,
-      wordsPerLesson: updated?.words_per_lesson,
       dailyLimit: updated?.daily_lesson_limit,
     });
 
-    const dict = updated ? await dictionariesRepo.findById(updated.dictionary_id) : null;
-    res.json({ profile: updated ? formatProfile(updated, dict) : null });
+    res.json({ profile: updated });
   } catch (err: any) {
     logger.error('LANGUAGES', 'DB error updating profile', { message: err.message });
     res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
   }
 });
 
-// GET /dictionaries?target_language=en&include_word_counts=true — словари пары en -> ru
+// GET /dictionaries?target_language=
 router.get('/dictionaries', authenticate, async (req: AuthenticatedRequest, res: Response) => {
-  const targetLanguage = String(req.query.target_language || TARGET_LANGUAGE);
-  const includeWordCounts = String(req.query.include_word_counts) === 'true';
-
-  if (targetLanguage !== TARGET_LANGUAGE) {
-    res.json({ dictionaries: [] });
-    return;
-  }
+  const user = req.user!;
+  const targetLanguage = String(req.query.target_language || 'en');
 
   try {
-    const dicts = await dictionariesRepo.findPair(TARGET_LANGUAGE, NATIVE_LANGUAGE);
+    const dicts = await dictionariesRepo.findPair(targetLanguage, user.native_language);
 
     const result = [];
     for (const d of dicts) {
-      const wordCount = includeWordCounts ? await dictionariesRepo.wordCount(d.id) : 0;
+      const wordCount = await dictionariesRepo.wordCount(d.id);
       result.push({
         id: d.id,
         code: d.code,
@@ -244,6 +264,36 @@ router.get('/dictionaries', authenticate, async (req: AuthenticatedRequest, res:
     res.json({ dictionaries: result });
   } catch (err: any) {
     logger.error('LANGUAGES', 'DB error listing dictionaries', { message: err.message });
+    res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
+  }
+});
+
+// PUT /me/active-language
+router.put('/me/active-language', authenticate, async (req: AuthenticatedRequest, res: Response) => {
+  const user = req.user!;
+  const { language_profile_id } = req.body;
+
+  try {
+    const profile = await profilesRepo.findByIdAndUser(language_profile_id, user.id);
+    if (!profile) {
+      logger.warn('LANGUAGES', 'Switch active profile failed: not found', { userId: user.id, language_profile_id });
+      res.status(404).json({
+        error: { code: 'profile_not_found', message: 'Профиль не найден' },
+      });
+      return;
+    }
+
+    await usersRepo.setActiveProfile(user.id, profile.id);
+    user.active_language_profile_id = profile.id;
+
+    logger.info('LANGUAGES', `Active language switched to ${profile.target_language} (profile: ${profile.id})`, {
+      userId: user.id,
+      targetLanguage: profile.target_language,
+    });
+
+    res.json({ success: true, active_language_profile_id: profile.id });
+  } catch (err: any) {
+    logger.error('LANGUAGES', 'DB error switching active profile', { message: err.message });
     res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
   }
 });

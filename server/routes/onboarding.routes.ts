@@ -1,50 +1,39 @@
-/**
- * Онбординг в упрощённой версии: пользователь выбирает уровень английского,
- * словарь (общий или тематический) и настройки уроков (слов в уроке, уроков в день).
- * Языки фиксированы: родной — русский, изучаемый — английский.
- */
 import { Router, Response } from 'express';
 import {
-  usersRepo, dictionariesRepo, profilesRepo, eventsRepo,
-  NATIVE_LANGUAGE, TARGET_LANGUAGE,
+  usersRepo, dictionariesRepo, languagesRepo, profilesRepo, eventsRepo,
 } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { logger } from '../logger.js';
 
 const router = Router();
 
-const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
-const WORDS_PER_LESSON_MIN = 3;
-const WORDS_PER_LESSON_MAX = 10;
-const DAILY_LESSON_LIMIT_MIN = 1;
-const DAILY_LESSON_LIMIT_MAX = parseInt(process.env.DAILY_LESSON_LIMIT_MAX || '5', 10);
-
-// GET /onboarding/setup — данные для шагов онбординга
-router.get('/setup', authenticate, async (req: AuthenticatedRequest, res: Response) => {
+// GET /languages/pairs?native=ru
+router.get('/pairs', async (req, res: Response) => {
+  const native = String(req.query.native || 'ru');
   try {
-    const dicts = await dictionariesRepo.findPair(TARGET_LANGUAGE, NATIVE_LANGUAGE);
+    const generalDicts = (await dictionariesRepo.all()).filter(
+      d => d.native_language === native && d.is_general
+    );
+    const languages = await languagesRepo.all();
 
-    logger.info('ONBOARDING', 'Onboarding setup retrieved', {
-      userId: req.user!.id,
-      dictionariesCount: dicts.length,
+    const supportedTargets = generalDicts.map(d => {
+      const lang = languages.find(l => l.code === d.target_language);
+      return {
+        code: d.target_language,
+        name: lang ? lang.name : d.target_language,
+        dictionary_id: d.id,
+        dictionary_name: d.name,
+      };
     });
 
-    res.json({
-      native_language: NATIVE_LANGUAGE,
-      target_language: TARGET_LANGUAGE,
-      levels: LEVELS,
-      dictionaries: dicts.map(d => ({
-        id: d.id,
-        code: d.code,
-        name: d.name,
-        description: d.description,
-        is_general: d.is_general,
-      })),
-      words_per_lesson: { min: WORDS_PER_LESSON_MIN, max: WORDS_PER_LESSON_MAX, default: 5 },
-      daily_lesson_limit: { min: DAILY_LESSON_LIMIT_MIN, max: DAILY_LESSON_LIMIT_MAX, default: 1 },
+    logger.info('ONBOARDING', `Language pairs retrieved for native language "${native}"`, {
+      pairsCount: supportedTargets.length,
+      languages: supportedTargets.map(p => p.code),
     });
+
+    res.json({ native_language: native, pairs: supportedTargets });
   } catch (err: any) {
-    logger.error('ONBOARDING', 'DB error loading onboarding setup', { message: err.message });
+    logger.error('ONBOARDING', 'DB error loading language pairs', { message: err.message });
     res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка базы данных' } });
   }
 });
@@ -60,89 +49,57 @@ router.post('/complete', authenticate, async (req: AuthenticatedRequest, res: Re
     return;
   }
 
-  const { level, dictionary_id, words_per_lesson, daily_lesson_limit, timezone } = req.body;
+  const { native_language, timezone, target_language, level } = req.body;
 
-  // В упрощённой версии язык всегда en->ru; принимаем target_language для обратной совместимости
-  const targetLanguage = req.body.target_language || TARGET_LANGUAGE;
-  if (targetLanguage !== TARGET_LANGUAGE) {
-    logger.warn('ONBOARDING', 'Onboarding rejected: unsupported language', { userId: user.id, targetLanguage });
+  if (!native_language || !target_language || !level) {
+    logger.warn('ONBOARDING', 'Onboarding validation failed: missing fields', { userId: user.id, body: req.body });
     res.status(422).json({
-      error: { code: 'unsupported_language', message: 'Доступен только английский язык' },
+      error: { code: 'validation_error', message: 'Все поля обязательны' },
     });
     return;
   }
 
-  if (!level || !LEVELS.includes(level)) {
-    logger.warn('ONBOARDING', 'Onboarding validation failed: invalid level', { userId: user.id, body: req.body });
+  if (target_language === native_language) {
     res.status(422).json({
-      error: { code: 'invalid_level', message: `Уровень должен быть одним из: ${LEVELS.join(', ')}` },
+      error: { code: 'same_language', message: 'Изучаемый язык не может совпадать с родным' },
     });
     return;
   }
 
-  if (!dictionary_id) {
+  const validLevels = ['A1', 'A2', 'B1', 'B2'];
+  if (!validLevels.includes(level)) {
     res.status(422).json({
-      error: { code: 'validation_error', message: 'Выберите словарь (общий или тематический)' },
-    });
-    return;
-  }
-
-  const wpl = parseInt(words_per_lesson ?? '5', 10);
-  if (isNaN(wpl) || wpl < WORDS_PER_LESSON_MIN || wpl > WORDS_PER_LESSON_MAX) {
-    res.status(422).json({
-      error: {
-        code: 'invalid_words_per_lesson',
-        message: `Количество слов в уроке должно быть от ${WORDS_PER_LESSON_MIN} до ${WORDS_PER_LESSON_MAX}`,
-      },
-    });
-    return;
-  }
-
-  const dll = parseInt(daily_lesson_limit ?? '1', 10);
-  if (isNaN(dll) || dll < DAILY_LESSON_LIMIT_MIN || dll > DAILY_LESSON_LIMIT_MAX) {
-    res.status(422).json({
-      error: {
-        code: 'invalid_daily_lesson_limit',
-        message: `Количество уроков в день должно быть от ${DAILY_LESSON_LIMIT_MIN} до ${DAILY_LESSON_LIMIT_MAX}`,
-      },
+      error: { code: 'invalid_level', message: 'Уровень должен быть от A1 до B2' },
     });
     return;
   }
 
   try {
-    // Выбранный словарь должен принадлежать паре en -> ru
-    const dict = await dictionariesRepo.findPairById(dictionary_id, TARGET_LANGUAGE, NATIVE_LANGUAGE);
-    if (!dict) {
-      logger.warn('ONBOARDING', 'Onboarding rejected: dictionary not found for pair', { userId: user.id, dictionary_id });
+    // Find general dictionary for this pair
+    const generalDict = await dictionariesRepo.findGeneralPair(native_language, target_language);
+    if (!generalDict) {
+      logger.warn('ONBOARDING', 'No general dictionary for language pair', { native_language, target_language });
       res.status(422).json({
-        error: { code: 'invalid_dictionary', message: 'Словарь не найден для пары «Английский → Русский»' },
+        error: { code: 'pair_not_supported', message: 'Для данной пары языков нет общего словаря' },
       });
       return;
     }
 
     const tz = timezone || 'Europe/Moscow';
-    try {
-      Intl.DateTimeFormat(undefined, { timeZone: tz });
-    } catch {
-      res.status(422).json({
-        error: { code: 'invalid_timezone', message: 'Некорректный часовой пояс' },
-      });
-      return;
-    }
 
-    // Создать единственный языковой профиль (en) с выбранными настройками
+    // Create language profile
     const newProfile = await profilesRepo.create({
       user_id: user.id,
-      target_language: TARGET_LANGUAGE,
+      target_language,
       level,
-      dictionary_id: dict.id,
-      daily_lesson_limit: dll,
-      words_per_lesson: wpl,
+      dictionary_id: generalDict.id,
+      daily_lesson_limit: 1,
       last_lesson_number: 0,
     });
 
+    // Update user
     const updatedUser = await usersRepo.update(user.id, {
-      native_language: NATIVE_LANGUAGE,
+      native_language,
       timezone: tz,
       is_onboarded: true,
       active_language_profile_id: newProfile.id,
@@ -150,22 +107,19 @@ router.post('/complete', authenticate, async (req: AuthenticatedRequest, res: Re
 
     if (updatedUser) Object.assign(user, updatedUser);
 
-    logger.success('ONBOARDING', 'Onboarding completed successfully!', {
+    logger.success('ONBOARDING', `Onboarding completed successfully!`, {
       userId: user.id,
       email: user.email,
+      targetLanguage: target_language,
       level,
       timezone: tz,
-      dictionaryId: dict.id,
-      dictionaryName: dict.name,
-      wordsPerLesson: wpl,
-      dailyLessonLimit: dll,
+      dictionaryId: generalDict.id,
     });
 
     eventsRepo.record(user.id, 'onboarding_completed', {
+      target_language,
       level,
-      dictionary_id: dict.id,
-      words_per_lesson: wpl,
-      daily_lesson_limit: dll,
+      dictionary_id: generalDict.id,
     });
 
     res.json({
@@ -175,7 +129,7 @@ router.post('/complete', authenticate, async (req: AuthenticatedRequest, res: Re
         email: user.email,
         is_onboarded: true,
         is_admin: user.is_admin,
-        native_language: NATIVE_LANGUAGE,
+        native_language,
         timezone: tz,
         active_language_profile_id: newProfile.id,
       },

@@ -9,7 +9,6 @@ import {
   profilesRepo, dictionariesRepo, wordsRepo, userWordsRepo,
   lessonsRepo, exercisesRepo, exerciseWordsRepo, suggestionsRepo,
   reportsRepo, eventsRepo, uuid, nowIso,
-  NATIVE_LANGUAGE,
 } from '../db.js';
 import { withTransaction, withProfileLock } from '../pg.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
@@ -19,9 +18,7 @@ import { getLocalDateString, getMidnightResetUtc, calculateStreak } from '../str
 import { logger } from '../logger.js';
 
 const router = Router();
-
-const WORDS_PER_LESSON_MIN = 3;
-const WORDS_PER_LESSON_MAX = 10;
+const WORDS_PER_LESSON = parseInt(process.env.WORDS_PER_LESSON || '5', 10);
 
 function getLevelsForProfile(level: string): string[] {
   if (level === 'A1') return ['A1'];
@@ -81,9 +78,6 @@ async function computePreview(profileId: string, userId: string, userTimezone: s
     for (const w of await wordsRepo.findByIds(dueWordIds)) dueWordsMap.set(w.id, w);
   }
 
-  // Размер урока задаёт пользователь (настройка профиля), а не переменная окружения
-  const wordsPerLesson = Math.min(Math.max(profile.words_per_lesson || 5, WORDS_PER_LESSON_MIN), WORDS_PER_LESSON_MAX);
-
   const dueRanked = dueUserWords
     .map(uw => {
       const word = dueWordsMap.get(uw.word_id)!;
@@ -93,10 +87,10 @@ async function computePreview(profileId: string, userId: string, userTimezone: s
     .filter(item => Boolean(item.word));
 
   dueRanked.sort((a, b) => a.rank.localeCompare(b.rank));
-  const selectedDue = dueRanked.slice(0, wordsPerLesson);
+  const selectedDue = dueRanked.slice(0, WORDS_PER_LESSON);
 
   // 5. New words from active dictionary
-  const neededNew = wordsPerLesson - selectedDue.length;
+  const neededNew = WORDS_PER_LESSON - selectedDue.length;
   let selectedNew: Array<{ word: Word; rank: string }> = [];
 
   if (neededNew > 0) {
@@ -110,7 +104,7 @@ async function computePreview(profileId: string, userId: string, userTimezone: s
       dictionaryId: profile.dictionary_id,
       excludeWordIds: existingUserWordIds,
       targetLanguage: profile.target_language,
-      nativeLanguage: NATIVE_LANGUAGE,
+      nativeLanguage: 'ru',
       allowedLevels,
       isGeneral,
     });
@@ -129,7 +123,7 @@ async function computePreview(profileId: string, userId: string, userTimezone: s
     return { state: 'no_words', lesson_number: nextLessonNumber };
   }
 
-  const dictionaryExhausted = totalWords < wordsPerLesson;
+  const dictionaryExhausted = totalWords < WORDS_PER_LESSON;
 
   return {
     state: 'ready',
@@ -314,15 +308,11 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
 
   // Advisory lock (pg_try_advisory_lock): параллельный запрос урока получает locked=false
   const { locked, result } = await withProfileLock(profile.id, async () => {
-    // Ограничиваем состав урока настройкой пользователя (слов в уроке)
-    const maxWords = Math.min(Math.max(profile.words_per_lesson || 5, WORDS_PER_LESSON_MIN), WORDS_PER_LESSON_MAX);
-    const allowedWordIds: string[] = Array.from(new Set(word_ids.map(String))).slice(0, maxWords);
-
     // Determine words for the lesson
-    const fetched = await wordsRepo.findByIds(allowedWordIds);
+    const fetched = await wordsRepo.findByIds(word_ids);
     const byId = new Map(fetched.map(w => [w.id, w]));
     const wordsList: Word[] = [];
-    for (const wid of allowedWordIds) {
+    for (const wid of word_ids) {
       const w = byId.get(wid);
       if (w) wordsList.push(w);
     }
@@ -723,11 +713,7 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
       let stageAfter: number | null = null;
 
       if (uw && uw.status === 'active') {
-        // Якорь SRS — номер последнего ЗАВЕРШЁННОГО урока на момент оценки,
-        // чтобы смена размера урока не ломала интервалы повторения.
-        const lastCompleted = await lessonsRepo.findLastCompletedByProfile(profile.id);
-        const anchorLessonNumber = lastCompleted ? lastCompleted.lesson_number : lesson.lesson_number - 1;
-        const srsRes = updateSrs(uw.stage, ev.result, anchorLessonNumber);
+        const srsRes = updateSrs(uw.stage, ev.result, lesson.lesson_number);
         stageBefore = uw.stage;
         stageAfter = srsRes.newStage;
 

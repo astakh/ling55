@@ -1,15 +1,10 @@
 /**
- * Слой доступа к данным: PostgreSQL (удалённый сервер). Упрощённая версия проекта:
- * один родной язык — русский (ru), один изучаемый — английский (en), несколько словарей.
+ * Слой доступа к данным: PostgreSQL (удалённый сервер).
  * Все операции выполняются SQL-запросами через пул соединений (server/pg.ts).
  * Интерфейсы строк соответствуют схеме scripts/sql/01_schema.sql.
  */
 import crypto from 'crypto';
 import { query, queryOne, exec, withTransaction } from './pg.js';
-
-// Константы упрощённой конфигурации
-export const NATIVE_LANGUAGE = 'ru';
-export const TARGET_LANGUAGE = 'en';
 
 // ----------------------------------------------------------------------------
 // Типы строк (camelCase не используется — как в колонках БД)
@@ -68,11 +63,10 @@ export interface Word {
 export interface UserLanguageProfile {
   id: string;
   user_id: string;
-  target_language: string;   // всегда 'en'
+  target_language: string;
   level: string;
   dictionary_id: string;
   daily_lesson_limit: number;
-  words_per_lesson: number;
   last_lesson_number: number;
   created_at: string;
 }
@@ -406,22 +400,21 @@ export const profilesRepo = {
       [userId]
     );
   },
-  findByUser(userId: string): Promise<UserLanguageProfile | null> {
-    // В упрощённой версии у пользователя ровно один профиль (en)
+  findByUserAndTarget(userId: string, target: string): Promise<UserLanguageProfile | null> {
     return queryOne<UserLanguageProfile>(
-      "SELECT * FROM user_language_profiles WHERE user_id = $1 AND target_language = 'en' LIMIT 1",
-      [userId]
+      'SELECT * FROM user_language_profiles WHERE user_id = $1 AND target_language = $2',
+      [userId, target]
     );
   },
   create(p: Omit<UserLanguageProfile, 'id' | 'created_at'>): Promise<UserLanguageProfile> {
     return queryOne<UserLanguageProfile>(
       `INSERT INTO user_language_profiles
-         (user_id, target_language, level, dictionary_id, daily_lesson_limit, words_per_lesson, last_lesson_number)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [p.user_id, p.target_language, p.level, p.dictionary_id, p.daily_lesson_limit, p.words_per_lesson, p.last_lesson_number]
+         (user_id, target_language, level, dictionary_id, daily_lesson_limit, last_lesson_number)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [p.user_id, p.target_language, p.level, p.dictionary_id, p.daily_lesson_limit, p.last_lesson_number]
     ).then(r => r!);
   },
-  update(id: string, patch: Partial<Pick<UserLanguageProfile, 'level' | 'dictionary_id' | 'daily_lesson_limit' | 'words_per_lesson' | 'last_lesson_number'>>): Promise<UserLanguageProfile | null> {
+  update(id: string, patch: Partial<Pick<UserLanguageProfile, 'level' | 'dictionary_id' | 'daily_lesson_limit' | 'last_lesson_number'>>): Promise<UserLanguageProfile | null> {
     const cols: string[] = [];
     const vals: any[] = [];
     for (const [k, v] of Object.entries(patch)) {
@@ -557,13 +550,6 @@ export const lessonsRepo = {
         WHERE p.user_id = $1 AND l.status = 'completed' AND l.completed_local_date IS NOT NULL`,
       [userId]
     ).then(rows => rows.map(r => r.completed_local_date));
-  },
-  findLastCompletedByProfile(profileId: string): Promise<Lesson | null> {
-    return queryOne<Lesson>(
-      `SELECT * FROM lessons WHERE language_profile_id = $1 AND status = 'completed'
-       ORDER BY lesson_number DESC LIMIT 1`,
-      [profileId]
-    );
   },
   create(l: {
     id?: string;

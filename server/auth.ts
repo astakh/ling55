@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
-import { db, User } from './db.js';
+import { User, usersRepo, refreshTokensRepo } from './db.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'secret-jwt-key-srs-context-llm-2026';
 const ACCESS_TOKEN_TTL_MIN = parseInt(process.env.ACCESS_TOKEN_TTL_MIN || '30', 10);
@@ -33,64 +33,46 @@ export function hashToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-export function createRefreshToken(userId: string, familyId?: string): { token: string; familyId: string } {
+export async function createRefreshToken(userId: string, familyId?: string): Promise<{ token: string; familyId: string }> {
   const token = crypto.randomBytes(40).toString('hex');
-  const token_hash = hashToken(token);
   const famId = familyId || crypto.randomUUID();
   const expiresAt = new Date();
   expiresAt.setDate(expiresAt.getDate() + REFRESH_TOKEN_TTL_DAYS);
 
-  db.tables.refresh_tokens.push({
-    id: crypto.randomUUID(),
-    user_id: userId,
-    family_id: famId,
-    token_hash,
-    expires_at: expiresAt.toISOString(),
-    revoked_at: null,
-    replaced_by: null,
-  });
-  db.save();
-
+  await refreshTokensRepo.create(userId, famId, hashToken(token), expiresAt.toISOString());
   return { token, familyId: famId };
 }
 
-export function rotateRefreshToken(oldToken: string): { accessToken: string; newRefreshToken: string; user: User } | null {
+export async function rotateRefreshToken(
+  oldToken: string
+): Promise<{ accessToken: string; newRefreshToken: string; user: User } | null> {
   const tokenHash = hashToken(oldToken);
-  const tokenRecord = db.tables.refresh_tokens.find(t => t.token_hash === tokenHash);
+  const tokenRecord = await refreshTokensRepo.findByHash(tokenHash);
 
   if (!tokenRecord) {
     return null;
   }
 
-  // Reuse detection: if already replaced or revoked, revoke entire family!
+  // Reuse detection: if already replaced or revoked, revoke the entire family!
   if (tokenRecord.revoked_at || tokenRecord.replaced_by) {
-    // Revoke whole family
-    for (const t of db.tables.refresh_tokens) {
-      if (t.family_id === tokenRecord.family_id) {
-        t.revoked_at = new Date().toISOString();
-      }
-    }
-    db.save();
+    await refreshTokensRepo.revokeFamily(tokenRecord.family_id);
     return null;
   }
 
   // Check expiration
   if (new Date(tokenRecord.expires_at) < new Date()) {
-    tokenRecord.revoked_at = new Date().toISOString();
-    db.save();
+    await refreshTokensRepo.revokeByHash(tokenHash);
     return null;
   }
 
-  const user = db.tables.users.find(u => u.id === tokenRecord.user_id);
+  const user = await usersRepo.findById(tokenRecord.user_id);
   if (!user) {
     return null;
   }
 
   // Issue new token and mark old as replaced
-  const { token: newRefreshToken } = createRefreshToken(user.id, tokenRecord.family_id);
-  const newHash = hashToken(newRefreshToken);
-  tokenRecord.replaced_by = newHash;
-  db.save();
+  const { token: newRefreshToken } = await createRefreshToken(user.id, tokenRecord.family_id);
+  await refreshTokensRepo.markReplaced(tokenHash, hashToken(newRefreshToken));
 
   const accessToken = generateAccessToken({
     userId: user.id,
@@ -101,22 +83,12 @@ export function rotateRefreshToken(oldToken: string): { accessToken: string; new
   return { accessToken, newRefreshToken, user };
 }
 
-export function revokeRefreshToken(token: string): void {
-  const tokenHash = hashToken(token);
-  const record = db.tables.refresh_tokens.find(t => t.token_hash === tokenHash);
-  if (record) {
-    record.revoked_at = new Date().toISOString();
-    db.save();
-  }
+export async function revokeRefreshToken(token: string): Promise<void> {
+  await refreshTokensRepo.revokeByHash(hashToken(token));
 }
 
-export function revokeAllUserTokens(userId: string): void {
-  for (const t of db.tables.refresh_tokens) {
-    if (t.user_id === userId) {
-      t.revoked_at = new Date().toISOString();
-    }
-  }
-  db.save();
+export async function revokeAllUserTokens(userId: string): Promise<void> {
+  await refreshTokensRepo.revokeAllForUser(userId);
 }
 
 export interface AuthenticatedRequest extends Request {
@@ -133,22 +105,34 @@ export function authenticate(req: AuthenticatedRequest, res: Response, next: Nex
   }
 
   const token = authHeader.substring(7);
+  let payload: TokenPayload;
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as TokenPayload;
-    const user = db.tables.users.find(u => u.id === payload.userId);
-    if (!user) {
-      res.status(401).json({
-        error: { code: 'unauthorized', message: 'Пользователь не найден' },
-      });
-      return;
-    }
-    req.user = user;
-    next();
+    payload = jwt.verify(token, JWT_SECRET) as TokenPayload;
   } catch (err) {
     res.status(401).json({
       error: { code: 'unauthorized', message: 'Недействительный или просроченный токен' },
     });
+    return;
   }
+
+  usersRepo
+    .findById(payload.userId)
+    .then(user => {
+      if (!user) {
+        res.status(401).json({
+          error: { code: 'unauthorized', message: 'Пользователь не найден' },
+        });
+        return;
+      }
+      req.user = user;
+      next();
+    })
+    .catch(err => {
+      console.error('AUTH DB error:', err);
+      res.status(500).json({
+        error: { code: 'internal_server_error', message: 'Ошибка базы данных' },
+      });
+    });
 }
 
 export function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction): void {

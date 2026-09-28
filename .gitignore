@@ -1,5 +1,5 @@
 # Editors/IDE
 .vscode/
 
-# Environment
-.env.local
+# Dependencies
+node_modules/

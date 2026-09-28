@@ -1,0 +1,43 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "dev: запуск сервера (npm run dev)",
+      "type": "shell",
+      "command": "npm run dev",
+      "isBackground": true,
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": {
+        "owner": "tsx-dev",
+        "pattern": { "regexp": "^$" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".",
+          "endsPattern": "Server listening on"
+        }
+      }
+    },
+    {
+      "label": "install: установка зависимостей (npm install)",
+      "type": "shell",
+      "command": "npm install",
+      "group": "build",
+      "presentation": { "reveal": "always", "panel": "shared" }
+    },
+    {
+      "label": "lint: проверка типов (tsc --noEmit)",
+      "type": "shell",
+      "command": "npm run lint",
+      "group": "test",
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "build: production-сборка (vite build)",
+      "type": "shell",
+      "command": "npm run build",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

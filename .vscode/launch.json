@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Dev: сервер + клиент (full compo)",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"],
+      "serverReadyAction": {
+        "pattern": "Server listening on http://0\\.0\\.0\\.0:([0-9]+)",
+        "uriFormat": "http://localhost:%s",
+        "action": "debugWithChrome"
+      }
+    },
+    {
+      "name": "Attach: подключиться к запущенному node --inspect",
+      "type": "node",
+      "request": "attach",
+      "port": 9229,
+      "skipFiles": ["<node_internals>/**"]
+    }
+  ],
+  "compounds": []
+}

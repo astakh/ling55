@@ -1,6 +1,16 @@
+/**
+ * Маршруты урока (алгоритмы 5.2–5.6, разделы 6.4–6.8).
+ * Все данные читаются/пишутся через слой доступа к PostgreSQL (server/db.ts).
+ */
 import { Router, Response } from 'express';
 import crypto from 'crypto';
-import { db, Word, UserWord } from '../db.js';
+import {
+  Word, UserWord, Lesson, LessonExercise,
+  profilesRepo, dictionariesRepo, wordsRepo, userWordsRepo,
+  lessonsRepo, exercisesRepo, exerciseWordsRepo, suggestionsRepo,
+  reportsRepo, eventsRepo, uuid, nowIso,
+} from '../db.js';
+import { withTransaction, withProfileLock } from '../pg.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { updateSrs } from '../srs.js';
 import { generateLessonSentences, evaluateTranslation, TargetWordEvalInput } from '../llm.js';
@@ -25,18 +35,14 @@ function sha256(input: string): string {
 /**
  * Preview word selection algorithm (Alg 5.2)
  */
-function computePreview(profileId: string, userId: string, userTimezone: string) {
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === profileId && p.user_id === userId
-  );
+async function computePreview(profileId: string, userId: string, userTimezone: string) {
+  const profile = await profilesRepo.findByIdAndUser(profileId, userId);
   if (!profile) return { error: 'not_found' };
 
   // 1. Check in_progress
-  const inProgress = db.tables.lessons.find(
-    l => l.language_profile_id === profile.id && l.status === 'in_progress'
-  );
+  const inProgress = await lessonsRepo.findInProgress(profile.id);
   if (inProgress) {
-    const exercises = db.tables.lesson_exercises.filter(e => e.lesson_id === inProgress.id);
+    const exercises = await exercisesRepo.listByLesson(inProgress.id);
     const done = exercises.filter(e => e.status === 'evaluated').length;
     return {
       state: 'resume',
@@ -48,9 +54,7 @@ function computePreview(profileId: string, userId: string, userTimezone: string)
 
   // 2. Check daily limit
   const today = getLocalDateString(new Date(), userTimezone);
-  const lessonsToday = db.tables.lessons.filter(
-    l => l.language_profile_id === profile.id && l.started_local_date === today
-  ).length;
+  const lessonsToday = await lessonsRepo.countStartedToday(profile.id, today);
 
   if (lessonsToday >= profile.daily_lesson_limit) {
     return {
@@ -66,18 +70,21 @@ function computePreview(profileId: string, userId: string, userTimezone: string)
   const seed = sha256(`${profile.id}:${nextLessonNumber}`);
 
   // 4. Due words: user_words active with due_lesson_number <= nextLessonNumber
-  const dueUserWords = db.tables.user_words.filter(
-    uw => uw.language_profile_id === profile.id &&
-          uw.status === 'active' &&
-          uw.due_lesson_number !== null &&
-          uw.due_lesson_number <= nextLessonNumber
-  );
+  const dueUserWords = await userWordsRepo.dueWords(profile.id, nextLessonNumber);
 
-  const dueRanked = dueUserWords.map(uw => {
-    const word = db.tables.words.find(w => w.id === uw.word_id)!;
-    const rank = sha256(`${seed}:${uw.word_id}`);
-    return { uw, word, rank };
-  }).filter(item => Boolean(item.word));
+  const dueWordIds = dueUserWords.map(uw => uw.word_id);
+  const dueWordsMap = new Map<string, Word>();
+  if (dueWordIds.length > 0) {
+    for (const w of await wordsRepo.findByIds(dueWordIds)) dueWordsMap.set(w.id, w);
+  }
+
+  const dueRanked = dueUserWords
+    .map(uw => {
+      const word = dueWordsMap.get(uw.word_id)!;
+      const rank = sha256(`${seed}:${uw.word_id}`);
+      return { uw, word, rank };
+    })
+    .filter(item => Boolean(item.word));
 
   dueRanked.sort((a, b) => a.rank.localeCompare(b.rank));
   const selectedDue = dueRanked.slice(0, WORDS_PER_LESSON);
@@ -87,36 +94,19 @@ function computePreview(profileId: string, userId: string, userTimezone: string)
   let selectedNew: Array<{ word: Word; rank: string }> = [];
 
   if (neededNew > 0) {
-    const existingUserWordIds = new Set(
-      db.tables.user_words
-        .filter(uw => uw.language_profile_id === profile.id)
-        .map(uw => uw.word_id)
-    );
+    const existingUserWordIds = await userWordsRepo.wordIdsByProfile(profile.id);
 
     const allowedLevels = getLevelsForProfile(profile.level);
-    const dict = db.tables.dictionaries.find(d => d.id === profile.dictionary_id);
+    const dict = await dictionariesRepo.findById(profile.dictionary_id);
     const isGeneral = dict ? dict.is_general : true;
 
-    // Get all word IDs in active dictionary
-    const dictWordIds = new Set(
-      db.tables.dictionary_words
-        .filter(dw => dw.dictionary_id === profile.dictionary_id)
-        .map(dw => dw.word_id)
-    );
-
-    const candidateWords = db.tables.words.filter(w => {
-      if (!dictWordIds.has(w.id)) return false;
-      if (existingUserWordIds.has(w.id)) return false;
-      if (w.target_language !== profile.target_language) return false;
-      if (w.native_language !== 'ru') return false;
-
-      // Level check
-      if (w.level !== null) {
-        return allowedLevels.includes(w.level);
-      } else {
-        // null level allowed in thematic dictionaries
-        return !isGeneral;
-      }
+    const candidateWords = await wordsRepo.candidatesFromDictionary({
+      dictionaryId: profile.dictionary_id,
+      excludeWordIds: existingUserWordIds,
+      targetLanguage: profile.target_language,
+      nativeLanguage: 'ru',
+      allowedLevels,
+      isGeneral,
     });
 
     const newRanked = candidateWords.map(w => ({
@@ -154,7 +144,7 @@ function computePreview(profileId: string, userId: string, userTimezone: string)
 }
 
 // POST /lesson/preview
-router.post('/preview', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.post('/preview', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const { language_profile_id } = req.body;
 
@@ -167,29 +157,34 @@ router.post('/preview', authenticate, (req: AuthenticatedRequest, res: Response)
     return;
   }
 
-  const preview = computePreview(profileId, user.id, user.timezone);
-  if (preview.error === 'not_found') {
-    logger.warn('LESSON', 'Preview request: profile not found', { userId: user.id, profileId });
-    res.status(403).json({
-      error: { code: 'forbidden', message: 'Профиль не найден или недоступен' },
+  try {
+    const preview = await computePreview(profileId, user.id, user.timezone);
+    if ((preview as any).error === 'not_found') {
+      logger.warn('LESSON', 'Preview request: profile not found', { userId: user.id, profileId });
+      res.status(403).json({
+        error: { code: 'forbidden', message: 'Профиль не найден или недоступен' },
+      });
+      return;
+    }
+
+    logger.info('LESSON', `Preview computed`, {
+      userId: user.id,
+      profileId,
+      state: (preview as any).state,
+      lessonNumber: (preview as any).lesson_number,
+      dueCount: (preview as any).due_words?.length || 0,
+      newCount: (preview as any).new_words?.length || 0,
     });
-    return;
+
+    res.json(preview);
+  } catch (err: any) {
+    logger.error('LESSON', 'Preview failed', { userId: user.id, message: err.message });
+    res.status(500).json({ error: { code: 'internal_server_error', message: 'Ошибка формирования превью' } });
   }
-
-  logger.info('LESSON', `Preview computed`, {
-    userId: user.id,
-    profileId,
-    state: preview.state,
-    lessonNumber: (preview as any).lesson_number,
-    dueCount: (preview as any).due_words?.length || 0,
-    newCount: (preview as any).new_words?.length || 0,
-  });
-
-  res.json(preview);
 });
 
 // POST /lesson/new-word/decline (Algorithm 5.3)
-router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.post('/new-word/decline', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const { language_profile_id, word_id } = req.body;
 
@@ -201,9 +196,7 @@ router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: 
   }
 
   const profileId = language_profile_id || user.active_language_profile_id;
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === profileId && p.user_id === user.id
-  );
+  const profile = await profilesRepo.findByIdAndUser(profileId, user.id);
   if (!profile) {
     res.status(403).json({
       error: { code: 'forbidden', message: 'Профиль не найден' },
@@ -212,9 +205,7 @@ router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: 
   }
 
   // Check in_progress
-  const inProgress = db.tables.lessons.find(
-    l => l.language_profile_id === profile.id && l.status === 'in_progress'
-  );
+  const inProgress = await lessonsRepo.findInProgress(profile.id);
   if (inProgress) {
     res.status(409).json({
       error: { code: 'lesson_in_progress', message: 'Нельзя отклонять слова во время идущего урока' },
@@ -222,7 +213,7 @@ router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: 
     return;
   }
 
-  const word = db.tables.words.find(w => w.id === word_id);
+  const word = await wordsRepo.findById(word_id);
   if (!word) {
     res.status(404).json({
       error: { code: 'word_not_found', message: 'Слово не найдено' },
@@ -231,9 +222,7 @@ router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: 
   }
 
   // Check status in user_words
-  const existingUserWord = db.tables.user_words.find(
-    uw => uw.language_profile_id === profile.id && uw.word_id === word_id
-  );
+  const existingUserWord = await userWordsRepo.findByProfileAndWord(profile.id, word_id);
 
   if (existingUserWord) {
     if (existingUserWord.status === 'active' || existingUserWord.status === 'mastered') {
@@ -243,19 +232,15 @@ router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: 
       return;
     }
   } else {
-    db.tables.user_words.push({
-      id: crypto.randomUUID(),
+    await userWordsRepo.create({
       language_profile_id: profile.id,
       word_id: word.id,
       status: 'ignored',
       stage: 0,
       due_lesson_number: null,
-      last_reviewed_at: null,
       source: 'decline',
-      created_at: new Date().toISOString(),
     });
-    db.save();
-    db.recordEvent(user.id, 'new_word_declined', { word_id, lemma: word.lemma });
+    await eventsRepo.record(user.id, 'new_word_declined', { word_id, lemma: word.lemma });
   }
 
   logger.info('LESSON', `New word declined`, {
@@ -265,7 +250,7 @@ router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: 
     lemma: word.lemma,
   });
 
-  const updatedPreview = computePreview(profile.id, user.id, user.timezone);
+  const updatedPreview = await computePreview(profile.id, user.id, user.timezone);
   res.json(updatedPreview);
 });
 
@@ -283,9 +268,7 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
   }
 
   const profileId = language_profile_id || user.active_language_profile_id;
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === profileId && p.user_id === user.id
-  );
+  const profile = await profilesRepo.findByIdAndUser(profileId, user.id);
   if (!profile) {
     logger.warn('LESSON', 'Start lesson rejected: forbidden profile', { userId: user.id, profileId });
     res.status(403).json({
@@ -295,9 +278,7 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
   }
 
   // Check in_progress
-  const inProgress = db.tables.lessons.find(
-    l => l.language_profile_id === profile.id && l.status === 'in_progress'
-  );
+  const inProgress = await lessonsRepo.findInProgress(profile.id);
   if (inProgress) {
     logger.warn('LESSON', 'Start lesson rejected: lesson already in progress', {
       userId: user.id,
@@ -311,9 +292,7 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
 
   // Check daily limit
   const today = getLocalDateString(new Date(), user.timezone);
-  const lessonsToday = db.tables.lessons.filter(
-    l => l.language_profile_id === profile.id && l.started_local_date === today
-  ).length;
+  const lessonsToday = await lessonsRepo.countStartedToday(profile.id, today);
 
   if (lessonsToday >= profile.daily_lesson_limit) {
     logger.warn('LESSON', 'Start lesson rejected: daily limit reached', {
@@ -327,30 +306,19 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
     return;
   }
 
-  // Advisory lock
-  if (!db.tryLockProfile(profile.id)) {
-    logger.warn('LESSON', 'Start lesson rejected: lock busy', { profileId: profile.id });
-    res.status(409).json({
-      error: { code: 'start_in_progress', message: 'Урок уже формируется' },
-    });
-    return;
-  }
-
-  try {
+  // Advisory lock (pg_try_advisory_lock): параллельный запрос урока получает locked=false
+  const { locked, result } = await withProfileLock(profile.id, async () => {
     // Determine words for the lesson
+    const fetched = await wordsRepo.findByIds(word_ids);
+    const byId = new Map(fetched.map(w => [w.id, w]));
     const wordsList: Word[] = [];
     for (const wid of word_ids) {
-      const w = db.tables.words.find(item => item.id === wid);
+      const w = byId.get(wid);
       if (w) wordsList.push(w);
     }
 
     if (wordsList.length === 0) {
-      db.unlockProfile(profile.id);
-      logger.warn('LESSON', 'Start lesson rejected: words not found in dictionary', { word_ids });
-      res.status(422).json({
-        error: { code: 'empty_words', message: 'Слова не найдены в словаре' },
-      });
-      return;
+      return { kind: 'empty_words' as const };
     }
 
     const nextLessonNumber = profile.last_lesson_number + 1;
@@ -366,7 +334,6 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
 
     // Cluster into k = ceil(N / 3) groups
     // Sizes differ by at most 1, smaller groups first.
-    // e.g. 5 -> [2, 3], 4 -> [2, 2], 6 -> [3, 3], 1 -> [1]
     const k = Math.ceil(N / 3);
     const groupSizes: number[] = [];
     const baseSize = Math.floor(N / k);
@@ -374,7 +341,6 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
     for (let i = 0; i < k; i++) {
       groupSizes.push(baseSize + (i >= k - remainder ? 1 : 0));
     }
-    // Sort ascending so smaller groups go first
     groupSizes.sort((a, b) => a - b);
 
     // Shuffle/distribute words deterministically
@@ -397,16 +363,9 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
       const slice = wordsWithRank.slice(cursor, cursor + size);
       cursor += size;
 
-      // Find past sentences avoiding repetition
+      // Past sentences containing these words (avoid repetition)
       const wordIdsInGroup = slice.map(s => s.word.id);
-      const pastExercises = db.tables.lesson_exercise_words
-        .filter(ew => wordIdsInGroup.includes(ew.word_id))
-        .map(ew => ew.exercise_id);
-
-      const avoidSentences = db.tables.lesson_exercises
-        .filter(e => pastExercises.includes(e.id))
-        .map(e => e.target_sentence)
-        .slice(0, 4);
+      const avoidSentences = await exercisesRepo.pastSentencesForWords(wordIdsInGroup, 4);
 
       promptGroups.push({
         group_index: gi,
@@ -419,9 +378,9 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
       });
     }
 
-    const lessonId = crypto.randomUUID();
+    const lessonId = uuid();
 
-    // Call LLM Prompt 1
+    // Call LLM Prompt 1 (до записи в БД — при ошибке ничего не сохраняем)
     const generatedGroups = await generateLessonSentences(
       profile.target_language,
       user.native_language,
@@ -436,118 +395,164 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
       lessonId
     );
 
-    // Atomic DB persistence
-    profile.last_lesson_number = nextLessonNumber;
-
-    const newLesson = {
-      id: lessonId,
-      language_profile_id: profile.id,
-      lesson_number: nextLessonNumber,
-      status: 'in_progress' as const,
-      words_per_lesson: N,
-      started_at: new Date().toISOString(),
-      started_local_date: today,
-      completed_at: null,
-      completed_local_date: null,
-      abandoned_at: null,
-    };
-    db.tables.lessons.push(newLesson);
-
-    // Enter new words into user_words as active, stage 0, due = this lesson
-    for (const w of wordsList) {
-      let uw = db.tables.user_words.find(
-        u => u.language_profile_id === profile.id && u.word_id === w.id
+    // Atomic DB persistence (транзакция)
+    const createdExercises = await withTransaction(async client => {
+      const lessonRes = await client.query(
+        `INSERT INTO lessons (id, language_profile_id, lesson_number, status, words_per_lesson, started_local_date)
+         VALUES ($1, $2, $3, 'in_progress', $4, $5) RETURNING *`,
+        [lessonId, profile.id, nextLessonNumber, N, today]
       );
-      if (!uw) {
-        db.tables.user_words.push({
-          id: crypto.randomUUID(),
-          language_profile_id: profile.id,
-          word_id: w.id,
-          status: 'active',
-          stage: 0,
-          due_lesson_number: nextLessonNumber,
-          last_reviewed_at: null,
-          source: 'dictionary',
-          created_at: new Date().toISOString(),
-        });
-        db.recordEvent(user.id, 'new_word_accepted', { word_id: w.id, lemma: w.lemma });
-      }
-    }
+      const newLesson = lessonRes.rows[0] as Lesson;
 
-    // Insert exercises and words
-    const createdExercises = [];
-    for (let i = 0; i < generatedGroups.length; i++) {
-      const gg = generatedGroups[i];
-      const origGroup = promptGroups[i];
-      const exerciseId = crypto.randomUUID();
+      await client.query(
+        'UPDATE user_language_profiles SET last_lesson_number = $2 WHERE id = $1',
+        [profile.id, nextLessonNumber]
+      );
 
-      const exercise = {
-        id: exerciseId,
-        lesson_id: lessonId,
-        order_index: i,
-        target_sentence: gg.sentence,
-        reference_translation: gg.reference_translation,
-        user_translation: null,
-        dont_know: false,
-        status: 'pending' as const,
-        evaluated_at: null,
-      };
-      db.tables.lesson_exercises.push(exercise);
-      createdExercises.push(exercise);
-
-      // Insert words
-      for (const wItem of origGroup.words) {
-        const foundWordMeta = gg.words.find(gw => gw.lemma.toLowerCase() === wItem.lemma.toLowerCase());
-        const surfaceForm = foundWordMeta ? foundWordMeta.surface_form : wItem.lemma;
-        const existingUw = db.tables.user_words.find(
-          u => u.language_profile_id === profile.id && u.word_id === wItem.wordId
+      // Enter new words into user_words as active, stage 0, due = this lesson
+      for (const w of wordsList) {
+        const ins = await client.query(
+          `INSERT INTO user_words (language_profile_id, word_id, status, stage, due_lesson_number, source)
+           VALUES ($1, $2, 'active', 0, $3, 'dictionary')
+           ON CONFLICT (language_profile_id, word_id) DO NOTHING
+           RETURNING id`,
+          [profile.id, w.id, nextLessonNumber]
         );
-        const stageBefore = existingUw ? existingUw.stage : 0;
-        const isNew = existingUw ? existingUw.stage === 0 && existingUw.last_reviewed_at === null : true;
-
-        db.tables.lesson_exercise_words.push({
-          id: crypto.randomUUID(),
-          exercise_id: exerciseId,
-          word_id: wItem.wordId,
-          is_target: true,
-          is_new: isNew,
-          surface_form: surfaceForm,
-          result: null,
-          user_fragment: null,
-          stage_before: stageBefore,
-          stage_after: null,
-        });
+        if (ins.rowCount && ins.rowCount > 0) {
+          void eventsRepo.record(user.id, 'new_word_accepted', { word_id: w.id, lemma: w.lemma });
+        }
       }
-    }
 
-    db.saveSync();
-    db.recordEvent(user.id, 'lesson_started', {
+      const exercises: LessonExercise[] = [];
+      for (let i = 0; i < generatedGroups.length; i++) {
+        const gg = generatedGroups[i];
+        const origGroup = promptGroups[i];
+        const exerciseId = uuid();
+
+        const exRes = await client.query(
+          `INSERT INTO lesson_exercises (id, lesson_id, order_index, target_sentence, reference_translation)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [exerciseId, newLesson.id, i, gg.sentence, gg.reference_translation]
+        );
+        exercises.push(exRes.rows[0] as LessonExercise);
+
+        for (const wItem of origGroup.words) {
+          const foundWordMeta = gg.words.find(gw => gw.lemma.toLowerCase() === wItem.lemma.toLowerCase());
+          const surfaceForm = foundWordMeta ? foundWordMeta.surface_form : wItem.lemma;
+
+          const uwRes = await client.query(
+            'SELECT * FROM user_words WHERE language_profile_id = $1 AND word_id = $2',
+            [profile.id, wItem.wordId]
+          );
+          const existingUw = uwRes.rows[0] as UserWord | undefined;
+          const stageBefore = existingUw ? existingUw.stage : 0;
+          const isNew = existingUw
+            ? existingUw.stage === 0 && existingUw.last_reviewed_at === null
+            : true;
+
+          await client.query(
+            `INSERT INTO lesson_exercise_words
+               (exercise_id, word_id, is_target, is_new, surface_form, stage_before)
+             VALUES ($1, $2, TRUE, $3, $4, $5)`,
+            [exerciseId, wItem.wordId, isNew, surfaceForm, stageBefore]
+          );
+        }
+      }
+      return exercises;
+    });
+
+    void eventsRepo.record(user.id, 'lesson_started', {
       lesson_id: lessonId,
       lesson_number: nextLessonNumber,
       words_count: N,
     });
 
-    const firstExercise = createdExercises[0];
+    return { kind: 'ok' as const, lessonId, nextLessonNumber, createdExercises };
+  });
 
-    res.json({
-      lesson_id: lessonId,
-      lesson_number: nextLessonNumber,
-      exercises_total: createdExercises.length,
-      current_exercise: {
-        exercise_id: firstExercise.id,
-        order_index: firstExercise.order_index,
-        sentence: firstExercise.target_sentence,
-      },
+  if (!locked) {
+    logger.warn('LESSON', 'Start lesson rejected: lock busy', { profileId: profile.id });
+    res.status(409).json({
+      error: { code: 'start_in_progress', message: 'Урок уже формируется' },
     });
-  } catch (err: any) {
-    console.error('Error starting lesson:', err);
+    return;
+  }
+
+  if (!result) {
     res.status(503).json({
       error: { code: 'llm_unavailable', message: 'Сервер временно перегружен, попробуйте еще раз' },
     });
-  } finally {
-    db.unlockProfile(profile.id);
+    return;
   }
+
+  if (result.kind === 'empty_words') {
+    logger.warn('LESSON', 'Start lesson rejected: words not found in dictionary', { word_ids });
+    res.status(422).json({
+      error: { code: 'empty_words', message: 'Слова не найдены в словаре' },
+    });
+    return;
+  }
+
+  const firstExercise = result.createdExercises[0];
+
+  res.json({
+    lesson_id: result.lessonId,
+    lesson_number: result.nextLessonNumber,
+    exercises_total: result.createdExercises.length,
+    current_exercise: {
+      exercise_id: firstExercise.id,
+      order_index: firstExercise.order_index,
+      sentence: firstExercise.target_sentence,
+    },
+  });
 });
+
+/** Формирование ответа упражнения (по данным из БД). */
+async function buildExerciseResponse(
+  exercise: LessonExercise,
+  lesson: Lesson,
+  extra?: Partial<{ lesson_completed: boolean }>
+) {
+  const exerciseWords = await exerciseWordsRepo.listByExercise(exercise.id, true);
+  const suggestions = await suggestionsRepo.listByExercise(exercise.id);
+  const pendingLeft = await exercisesRepo.countPending(lesson.id);
+
+  const wordIds = [...exerciseWords.map(ew => ew.word_id), ...suggestions.map(s => s.word_id)];
+  const words = await wordsRepo.findByIds(wordIds);
+  const wordsMap = new Map(words.map(w => [w.id, w]));
+
+  return {
+    exercise_id: exercise.id,
+    target_sentence: exercise.target_sentence,
+    reference_translation: exercise.reference_translation,
+    user_translation: exercise.user_translation,
+    words: exerciseWords.map(ew => {
+      const w = wordsMap.get(ew.word_id)!;
+      return {
+        word_id: w.id,
+        lemma: w.lemma,
+        pos: w.pos,
+        surface_form: ew.surface_form,
+        result: ew.result,
+        user_fragment: ew.user_fragment,
+        translations: w.translations,
+      };
+    }),
+    suggestions: suggestions.map(s => {
+      const w = wordsMap.get(s.word_id);
+      return {
+        word_id: s.word_id,
+        lemma: w ? w.lemma : '',
+        pos: w ? w.pos : 'noun',
+        translations: w ? w.translations : [],
+        state: s.state,
+      };
+    }),
+    lesson_completed: extra && extra.lesson_completed !== undefined
+      ? extra.lesson_completed
+      : pendingLeft === 0,
+  };
+}
 
 // POST /lesson/evaluate (Algorithm 5.5)
 router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Response) => {
@@ -562,7 +567,7 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
     return;
   }
 
-  const exercise = db.tables.lesson_exercises.find(e => e.id === exercise_id);
+  const exercise = await exercisesRepo.findById(exercise_id);
   if (!exercise) {
     logger.warn('LESSON', 'Evaluation rejected: exercise not found', { exercise_id });
     res.status(404).json({
@@ -571,7 +576,7 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
     return;
   }
 
-  const lesson = db.tables.lessons.find(l => l.id === exercise.lesson_id);
+  const lesson = await lessonsRepo.findById(exercise.lesson_id);
   if (!lesson) {
     res.status(404).json({
       error: { code: 'lesson_not_found', message: 'Урок не найден' },
@@ -579,9 +584,7 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
     return;
   }
 
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === lesson.language_profile_id && p.user_id === user.id
-  );
+  const profile = await profilesRepo.findByIdAndUser(lesson.language_profile_id, user.id);
   if (!profile) {
     res.status(403).json({
       error: { code: 'forbidden', message: 'Доступ запрещен' },
@@ -592,46 +595,7 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
   // Idempotency: if already evaluated, return saved result
   if (exercise.status === 'evaluated') {
     logger.info('LESSON', 'Evaluation returned from cache (idempotent)', { exerciseId: exercise.id });
-    const exerciseWords = db.tables.lesson_exercise_words.filter(
-      ew => ew.exercise_id === exercise.id && ew.is_target
-    );
-    const suggestions = db.tables.lesson_exercise_suggestions.filter(
-      s => s.exercise_id === exercise.id
-    );
-
-    const pendingLeft = db.tables.lesson_exercises.filter(
-      e => e.lesson_id === lesson.id && e.status === 'pending'
-    ).length;
-
-    res.json({
-      exercise_id: exercise.id,
-      target_sentence: exercise.target_sentence,
-      reference_translation: exercise.reference_translation,
-      user_translation: exercise.user_translation,
-      words: exerciseWords.map(ew => {
-        const w = db.tables.words.find(item => item.id === ew.word_id)!;
-        return {
-          word_id: w.id,
-          lemma: w.lemma,
-          pos: w.pos,
-          surface_form: ew.surface_form,
-          result: ew.result,
-          user_fragment: ew.user_fragment,
-          translations: w.translations,
-        };
-      }),
-      suggestions: suggestions.map(s => {
-        const w = db.tables.words.find(item => item.id === s.word_id);
-        return {
-          word_id: s.word_id,
-          lemma: w ? w.lemma : '',
-          pos: w ? w.pos : 'noun',
-          translations: w ? w.translations : [],
-          state: s.state,
-        };
-      }),
-      lesson_completed: pendingLeft === 0,
-    });
+    res.json(await buildExerciseResponse(exercise, lesson));
     return;
   }
 
@@ -644,11 +608,8 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
   }
 
   // Order check: evaluate only first pending exercise
-  const allPending = db.tables.lesson_exercises
-    .filter(e => e.lesson_id === lesson.id && e.status === 'pending')
-    .sort((a, b) => a.order_index - b.order_index);
-
-  if (allPending.length === 0 || allPending[0].id !== exercise.id) {
+  const currentPending = await exercisesRepo.firstPending(lesson.id);
+  if (!currentPending || currentPending.id !== exercise.id) {
     res.status(409).json({
       error: { code: 'not_current_exercise', message: 'Это не текущее упражнение урока' },
     });
@@ -656,12 +617,13 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
   }
 
   // Target words for this exercise
-  const exerciseWords = db.tables.lesson_exercise_words.filter(
-    ew => ew.exercise_id === exercise.id && ew.is_target
-  );
+  const exerciseWords = await exerciseWordsRepo.listByExercise(exercise.id, true);
+  const evalWordIds = exerciseWords.map(ew => ew.word_id);
+  const evalWords = await wordsRepo.findByIds(evalWordIds);
+  const evalWordsMap = new Map(evalWords.map(w => [w.id, w]));
 
   const targetWordsInput: TargetWordEvalInput[] = exerciseWords.map(ew => {
-    const w = db.tables.words.find(item => item.id === ew.word_id)!;
+    const w = evalWordsMap.get(ew.word_id)!;
     return {
       word_id: w.id,
       lemma: w.lemma,
@@ -715,116 +677,146 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
     }
   }
 
-  // Update DB transaction
-  exercise.user_translation = isDontKnow ? null : (user_translation || '');
-  exercise.dont_know = isDontKnow;
-  exercise.status = 'evaluated';
-  exercise.evaluated_at = new Date().toISOString();
-
-  const formattedWordsResponse = [];
-
-  for (const ew of exerciseWords) {
-    const ev = evalResult.evaluations.find(e => e.word_id === ew.word_id) || {
-      word_id: ew.word_id,
-      result: 'incorrect' as const,
-      user_fragment: null,
-    };
-
-    ew.result = ev.result;
-    ew.user_fragment = ev.user_fragment;
-
-    // SRS Update
-    const uw = db.tables.user_words.find(
-      u => u.language_profile_id === profile.id && u.word_id === ew.word_id
+  // Persist evaluation atomically
+  const completedLocalDate = getLocalDateString(new Date(), user.timezone);
+  const outcome = await withTransaction(async client => {
+    const exRes = await client.query(
+      `UPDATE lesson_exercises
+       SET user_translation = $2, dont_know = $3, status = 'evaluated', evaluated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING *`,
+      [exercise.id, isDontKnow ? null : (user_translation || ''), isDontKnow]
     );
+    // Параллельный повторный запрос: результат уже сохранён — вернём кэшированный
+    if (!exRes.rows[0]) return { raced: true as const };
+    const updatedExercise = exRes.rows[0] as LessonExercise;
 
-    if (uw && uw.status === 'active') {
-      const srsRes = updateSrs(uw.stage, ev.result, lesson.lesson_number);
-      ew.stage_before = uw.stage;
-      ew.stage_after = srsRes.newStage;
+    const formattedWordsResponse = [];
 
-      uw.stage = srsRes.newStage;
-      uw.due_lesson_number = srsRes.dueLessonNumber;
-      uw.status = srsRes.status;
-      uw.last_reviewed_at = new Date().toISOString();
+    for (const ew of exerciseWords) {
+      const ev = evalResult.evaluations.find(e => e.word_id === ew.word_id) || {
+        word_id: ew.word_id,
+        result: 'incorrect' as const,
+        user_fragment: null,
+      };
+
+      const w = evalWordsMap.get(ew.word_id)!;
+
+      // SRS Update
+      const uwRes = await client.query(
+        'SELECT * FROM user_words WHERE language_profile_id = $1 AND word_id = $2',
+        [profile.id, ew.word_id]
+      );
+      const uw = uwRes.rows[0] as UserWord | undefined;
+
+      let stageBefore: number | null = null;
+      let stageAfter: number | null = null;
+
+      if (uw && uw.status === 'active') {
+        const srsRes = updateSrs(uw.stage, ev.result, lesson.lesson_number);
+        stageBefore = uw.stage;
+        stageAfter = srsRes.newStage;
+
+        await client.query(
+          `UPDATE user_words
+             SET stage = $2, due_lesson_number = $3, status = $4, last_reviewed_at = now()
+           WHERE id = $1`,
+          [uw.id, srsRes.newStage, srsRes.dueLessonNumber, srsRes.status]
+        );
+      }
+
+      await client.query(
+        `UPDATE lesson_exercise_words
+           SET result = $2, user_fragment = $3, stage_before = $4, stage_after = $5
+         WHERE id = $1`,
+        [ew.id, ev.result, ev.user_fragment, stageBefore, stageAfter]
+      );
+
+      formattedWordsResponse.push({
+        word_id: w.id,
+        lemma: w.lemma,
+        pos: w.pos,
+        surface_form: ew.surface_form,
+        result: ev.result,
+        user_fragment: ev.user_fragment,
+        translations: w.translations,
+      });
     }
 
-    const w = db.tables.words.find(item => item.id === ew.word_id)!;
-    formattedWordsResponse.push({
-      word_id: w.id,
-      lemma: w.lemma,
-      pos: w.pos,
-      surface_form: ew.surface_form,
-      result: ew.result,
-      user_fragment: ew.user_fragment,
-      translations: w.translations,
-    });
-  }
+    // Match suggested words against dictionary
+    const allowedSuggestions = [];
+    const existingUserWordIds = new Set(await userWordsRepo.wordIdsByProfile(profile.id));
 
-  // Match suggested words against dictionary
-  const allowedSuggestions = [];
-  const existingUserWordIds = new Set(
-    db.tables.user_words
-      .filter(u => u.language_profile_id === profile.id)
-      .map(u => u.word_id)
-  );
-
-  for (const sw of evalResult.new_suggested_words) {
-    const lemmaKey = sw.lemma.trim().normalize('NFC').toLowerCase();
-    const matchedWord = db.tables.words.find(
-      w => w.target_language === profile.target_language &&
-           w.native_language === user.native_language &&
-           w.lemma_key === lemmaKey
-    );
-
-    if (matchedWord && !existingUserWordIds.has(matchedWord.id)) {
-      // Check if already suggested
-      const alreadySuggested = db.tables.lesson_exercise_suggestions.some(
-        s => s.exercise_id === exercise.id && s.word_id === matchedWord.id
+    for (const sw of evalResult.new_suggested_words) {
+      const lemmaKey = sw.lemma.trim().normalize('NFC').toLowerCase();
+      const matchedWord = await wordsRepo.findByLemmaKey(
+        profile.target_language, user.native_language, lemmaKey
       );
-      if (!alreadySuggested) {
-        db.tables.lesson_exercise_suggestions.push({
-          id: crypto.randomUUID(),
-          exercise_id: exercise.id,
-          word_id: matchedWord.id,
-          state: 'suggested',
+
+      if (matchedWord && !existingUserWordIds.has(matchedWord.id)) {
+        const created = await client.query(
+          `INSERT INTO lesson_exercise_suggestions (exercise_id, word_id, state)
+           VALUES ($1, $2, 'suggested')
+           ON CONFLICT (exercise_id, word_id) DO NOTHING
+           RETURNING *`,
+          [exercise.id, matchedWord.id]
+        );
+        if (created.rows[0]) {
+          allowedSuggestions.push({
+            word_id: matchedWord.id,
+            lemma: matchedWord.lemma,
+            pos: matchedWord.pos,
+            translations: matchedWord.translations,
+            state: 'suggested',
+          });
+        }
+      }
+    }
+
+    // Auto-complete lesson if no pending exercises remain
+    const pendingLeftRes = await client.query(
+      `SELECT COUNT(*)::int AS c FROM lesson_exercises WHERE lesson_id = $1 AND status = 'pending'`,
+      [lesson.id]
+    );
+    let lessonCompleted = false;
+    if (Number(pendingLeftRes.rows[0].c) === 0) {
+      const compRes = await client.query(
+        `UPDATE lessons
+            SET status = 'completed', completed_at = now(), completed_local_date = $2
+          WHERE id = $1 AND status = 'in_progress'
+          RETURNING *`,
+        [lesson.id, completedLocalDate]
+      );
+      lessonCompleted = Boolean(compRes.rows[0]);
+
+      if (lessonCompleted) {
+        logger.success('LESSON', `Lesson #${lesson.lesson_number} auto-completed!`, {
+          lessonId: lesson.id,
+          completedLocalDate,
         });
-        allowedSuggestions.push({
-          word_id: matchedWord.id,
-          lemma: matchedWord.lemma,
-          pos: matchedWord.pos,
-          translations: matchedWord.translations,
-          state: 'suggested',
+        void eventsRepo.record(user.id, 'lesson_completed', {
+          lesson_id: lesson.id,
+          lesson_number: lesson.lesson_number,
         });
       }
     }
+
+    return {
+      raced: false as const,
+      updatedExercise,
+      formattedWordsResponse,
+      allowedSuggestions,
+      lessonCompleted,
+    };
+  });
+
+  if (outcome.raced) {
+    const fresh = await exercisesRepo.findById(exercise.id);
+    res.json(await buildExerciseResponse(fresh!, lesson));
+    return;
   }
 
-  // Auto-complete lesson if no pending exercises remain
-  const pendingLeft = db.tables.lesson_exercises.filter(
-    e => e.lesson_id === lesson.id && e.status === 'pending'
-  ).length;
-
-  let lessonCompleted = false;
-  if (pendingLeft === 0) {
-    lesson.status = 'completed';
-    lesson.completed_at = new Date().toISOString();
-    lesson.completed_local_date = getLocalDateString(new Date(), user.timezone);
-    lessonCompleted = true;
-
-    logger.success('LESSON', `Lesson #${lesson.lesson_number} auto-completed!`, {
-      lessonId: lesson.id,
-      completedLocalDate: lesson.completed_local_date,
-    });
-
-    db.recordEvent(user.id, 'lesson_completed', {
-      lesson_id: lesson.id,
-      lesson_number: lesson.lesson_number,
-    });
-  }
-
-  db.saveSync();
-  db.recordEvent(user.id, 'exercise_evaluated', {
+  void eventsRepo.record(user.id, 'exercise_evaluated', {
     exercise_id: exercise.id,
     lesson_id: lesson.id,
     dont_know: isDontKnow,
@@ -834,26 +826,26 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
     exerciseId: exercise.id,
     orderIndex: exercise.order_index,
     dontKnow: isDontKnow,
-    results: formattedWordsResponse.map(w => `${w.lemma}:${w.result}`),
-    suggestionsCount: allowedSuggestions.length,
-    lessonCompleted,
+    results: outcome.formattedWordsResponse.map(w => `${w.lemma}:${w.result}`),
+    suggestionsCount: outcome.allowedSuggestions.length,
+    lessonCompleted: outcome.lessonCompleted,
   });
 
   res.json({
     exercise_id: exercise.id,
     target_sentence: exercise.target_sentence,
     reference_translation: exercise.reference_translation,
-    user_translation: exercise.user_translation,
-    words: formattedWordsResponse,
-    suggestions: allowedSuggestions,
-    lesson_completed: lessonCompleted,
+    user_translation: outcome.updatedExercise.user_translation,
+    words: outcome.formattedWordsResponse,
+    suggestions: outcome.allowedSuggestions,
+    lesson_completed: outcome.lessonCompleted,
   });
 });
 
 // GET /lesson/:id/current (Section 6.4 Resume)
-router.get('/:id/current', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id/current', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
-  const lesson = db.tables.lessons.find(l => l.id === req.params.id);
+  const lesson = await lessonsRepo.findById(req.params.id);
   if (!lesson) {
     logger.warn('LESSON', 'Current exercise request: lesson not found', { lessonId: req.params.id });
     res.status(404).json({
@@ -862,9 +854,7 @@ router.get('/:id/current', authenticate, (req: AuthenticatedRequest, res: Respon
     return;
   }
 
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === lesson.language_profile_id && p.user_id === user.id
-  );
+  const profile = await profilesRepo.findByIdAndUser(lesson.language_profile_id, user.id);
   if (!profile) {
     res.status(403).json({
       error: { code: 'forbidden', message: 'Доступ запрещен' },
@@ -872,9 +862,7 @@ router.get('/:id/current', authenticate, (req: AuthenticatedRequest, res: Respon
     return;
   }
 
-  const exercises = db.tables.lesson_exercises
-    .filter(e => e.lesson_id === lesson.id)
-    .sort((a, b) => a.order_index - b.order_index);
+  const exercises = await exercisesRepo.listByLesson(lesson.id);
 
   const doneCount = exercises.filter(e => e.status === 'evaluated').length;
   const currentPending = exercises.find(e => e.status === 'pending');
@@ -904,9 +892,9 @@ router.get('/:id/current', authenticate, (req: AuthenticatedRequest, res: Respon
 });
 
 // GET /lesson/:id/summary (Algorithm 5.6)
-router.get('/:id/summary', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id/summary', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
-  const lesson = db.tables.lessons.find(l => l.id === req.params.id);
+  const lesson = await lessonsRepo.findById(req.params.id);
   if (!lesson) {
     res.status(404).json({
       error: { code: 'not_found', message: 'Урок не найден' },
@@ -914,9 +902,7 @@ router.get('/:id/summary', authenticate, (req: AuthenticatedRequest, res: Respon
     return;
   }
 
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === lesson.language_profile_id && p.user_id === user.id
-  );
+  const profile = await profilesRepo.findByIdAndUser(lesson.language_profile_id, user.id);
   if (!profile) {
     res.status(403).json({
       error: { code: 'forbidden', message: 'Доступ запрещен' },
@@ -931,11 +917,10 @@ router.get('/:id/summary', authenticate, (req: AuthenticatedRequest, res: Respon
     return;
   }
 
-  const exercises = db.tables.lesson_exercises.filter(e => e.lesson_id === lesson.id);
-  const exerciseIds = new Set(exercises.map(e => e.id));
-  const exerciseWords = db.tables.lesson_exercise_words.filter(
-    ew => exerciseIds.has(ew.exercise_id) && ew.is_target
-  );
+  const exercises = await exercisesRepo.listByLesson(lesson.id);
+  const exerciseIds = exercises.map(e => e.id);
+  const exerciseWords = await exerciseWordsRepo.listByExercise(exerciseIds[0] ?? '', true)
+    .then(async () => await exerciseWordsRepo.listByExercises(exerciseIds, true));
 
   const correctCount = exerciseWords.filter(ew => ew.result === 'correct').length;
   const typoCount = exerciseWords.filter(ew => ew.result === 'typo').length;
@@ -946,26 +931,25 @@ router.get('/:id/summary', authenticate, (req: AuthenticatedRequest, res: Respon
   const reviewedCount = exerciseWords.length - newWordsCount;
 
   // Count suggestions added
-  const suggestionsAdded = db.tables.lesson_exercise_suggestions.filter(
-    s => exerciseIds.has(s.exercise_id) && s.state === 'added'
-  ).length;
+  const suggestionsAdded = await suggestionsRepo.countAddedByExerciseIds(exerciseIds);
 
   // Streak calculation
   const today = getLocalDateString(new Date(), user.timezone);
-  const completedLessons = db.tables.lessons.filter(l => {
-    const p = db.tables.user_language_profiles.find(lp => lp.id === l.language_profile_id);
-    return p && p.user_id === user.id && l.status === 'completed' && l.completed_local_date;
-  });
-
-  const completedDates = completedLessons.map(l => l.completed_local_date!);
+  const completedDates = await lessonsRepo.completedDatesByUser(user.id);
   const streak = calculateStreak(completedDates, today);
 
   // extended_today: true if this lesson was the FIRST completed for its completed_local_date
-  const lessonsOnSameDate = completedLessons.filter(
-    l => l.completed_local_date === lesson.completed_local_date
-  ).sort((a, b) => new Date(a.completed_at!).getTime() - new Date(b.completed_at!).getTime());
+  const allLessons = await (async () => {
+    const profiles = await profilesRepo.listByUser(user.id);
+    const ids = profiles.map(p => p.id);
+    const res = await Promise.all(ids.map(pid => lessonsRepo.listByProfile(pid)));
+    return res.flat();
+  })();
+  const completedOnSameDate = allLessons
+    .filter(l => l.status === 'completed' && l.completed_local_date === lesson.completed_local_date)
+    .sort((a, b) => new Date(a.completed_at ?? 0).getTime() - new Date(b.completed_at ?? 0).getTime());
 
-  const extendedToday = lessonsOnSameDate.length > 0 && lessonsOnSameDate[0].id === lesson.id;
+  const extendedToday = completedOnSameDate.length > 0 && completedOnSameDate[0].id === lesson.id;
 
   logger.info('LESSON', `Summary fetched for lesson #${lesson.lesson_number}`, {
     lessonId: lesson.id,
@@ -995,21 +979,19 @@ router.get('/:id/summary', authenticate, (req: AuthenticatedRequest, res: Respon
 });
 
 // GET /lesson/:id/exercises/:eid/result
-router.get('/:id/exercises/:eid/result', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id/exercises/:eid/result', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
-  const lesson = db.tables.lessons.find(l => l.id === req.params.id);
-  const exercise = db.tables.lesson_exercises.find(e => e.id === req.params.eid && e.lesson_id === req.params.id);
+  const lesson = await lessonsRepo.findById(req.params.id);
+  const exercise = await exercisesRepo.findById(req.params.eid);
 
-  if (!lesson || !exercise) {
+  if (!lesson || !exercise || exercise.lesson_id !== lesson.id) {
     res.status(404).json({
       error: { code: 'not_found', message: 'Упражнение не найдено' },
     });
     return;
   }
 
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === lesson.language_profile_id && p.user_id === user.id
-  );
+  const profile = await profilesRepo.findByIdAndUser(lesson.language_profile_id, user.id);
   if (!profile) {
     res.status(403).json({
       error: { code: 'forbidden', message: 'Доступ запрещен' },
@@ -1017,52 +999,13 @@ router.get('/:id/exercises/:eid/result', authenticate, (req: AuthenticatedReques
     return;
   }
 
-  const exerciseWords = db.tables.lesson_exercise_words.filter(
-    ew => ew.exercise_id === exercise.id && ew.is_target
-  );
-  const suggestions = db.tables.lesson_exercise_suggestions.filter(
-    s => s.exercise_id === exercise.id
-  );
-
-  const pendingLeft = db.tables.lesson_exercises.filter(
-    e => e.lesson_id === lesson.id && e.status === 'pending'
-  ).length;
-
-  res.json({
-    exercise_id: exercise.id,
-    target_sentence: exercise.target_sentence,
-    reference_translation: exercise.reference_translation,
-    user_translation: exercise.user_translation,
-    words: exerciseWords.map(ew => {
-      const w = db.tables.words.find(item => item.id === ew.word_id)!;
-      return {
-        word_id: w.id,
-        lemma: w.lemma,
-        pos: w.pos,
-        surface_form: ew.surface_form,
-        result: ew.result,
-        user_fragment: ew.user_fragment,
-        translations: w.translations,
-      };
-    }),
-    suggestions: suggestions.map(s => {
-      const w = db.tables.words.find(item => item.id === s.word_id);
-      return {
-        word_id: s.word_id,
-        lemma: w ? w.lemma : '',
-        pos: w ? w.pos : 'noun',
-        translations: w ? w.translations : [],
-        state: s.state,
-      };
-    }),
-    lesson_completed: pendingLeft === 0,
-  });
+  res.json(await buildExerciseResponse(exercise, lesson));
 });
 
 // POST /lesson/:id/abandon (Section 6.4)
-router.post('/:id/abandon', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.post('/:id/abandon', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
-  const lesson = db.tables.lessons.find(l => l.id === req.params.id);
+  const lesson = await lessonsRepo.findById(req.params.id);
   if (!lesson) {
     res.status(404).json({
       error: { code: 'not_found', message: 'Урок не найден' },
@@ -1070,9 +1013,7 @@ router.post('/:id/abandon', authenticate, (req: AuthenticatedRequest, res: Respo
     return;
   }
 
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === lesson.language_profile_id && p.user_id === user.id
-  );
+  const profile = await profilesRepo.findByIdAndUser(lesson.language_profile_id, user.id);
   if (!profile) {
     res.status(403).json({
       error: { code: 'forbidden', message: 'Доступ запрещен' },
@@ -1092,16 +1033,14 @@ router.post('/:id/abandon', authenticate, (req: AuthenticatedRequest, res: Respo
     return;
   }
 
-  lesson.status = 'abandoned';
-  lesson.abandoned_at = new Date().toISOString();
-  db.saveSync();
+  await lessonsRepo.markAbandoned(lesson.id);
 
   logger.warn('LESSON', `Lesson #${lesson.lesson_number} abandoned by user`, {
     userId: user.id,
     lessonId: lesson.id,
   });
 
-  db.recordEvent(user.id, 'lesson_abandoned', {
+  await eventsRepo.record(user.id, 'lesson_abandoned', {
     lesson_id: lesson.id,
     lesson_number: lesson.lesson_number,
   });
@@ -1110,12 +1049,12 @@ router.post('/:id/abandon', authenticate, (req: AuthenticatedRequest, res: Respo
 });
 
 // POST /lesson/exercises/:eid/suggestions/:word_id { action: 'add' | 'ignore' } (Section 6.6)
-router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.post('/exercises/:eid/suggestions/:word_id', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const { eid, word_id } = req.params;
   const { action } = req.body;
 
-  const exercise = db.tables.lesson_exercises.find(e => e.id === eid);
+  const exercise = await exercisesRepo.findById(eid);
   if (!exercise) {
     res.status(404).json({
       error: { code: 'not_found', message: 'Упражнение не найдено' },
@@ -1123,10 +1062,15 @@ router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: Authenti
     return;
   }
 
-  const lesson = db.tables.lessons.find(l => l.id === exercise.lesson_id)!;
-  const profile = db.tables.user_language_profiles.find(
-    p => p.id === lesson.language_profile_id && p.user_id === user.id
-  );
+  const lesson = await lessonsRepo.findById(exercise.lesson_id);
+  if (!lesson) {
+    res.status(404).json({
+      error: { code: 'not_found', message: 'Урок не найден' },
+    });
+    return;
+  }
+
+  const profile = await profilesRepo.findByIdAndUser(lesson.language_profile_id, user.id);
   if (!profile) {
     res.status(403).json({
       error: { code: 'forbidden', message: 'Доступ запрещен' },
@@ -1134,9 +1078,7 @@ router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: Authenti
     return;
   }
 
-  const suggestion = db.tables.lesson_exercise_suggestions.find(
-    s => s.exercise_id === eid && s.word_id === word_id
-  );
+  const suggestion = await suggestionsRepo.findByExerciseAndWord(eid, word_id);
   if (!suggestion) {
     res.status(404).json({
       error: { code: 'suggestion_not_found', message: 'Подсказка не найдена' },
@@ -1144,7 +1086,7 @@ router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: Authenti
     return;
   }
 
-  const word = db.tables.words.find(w => w.id === word_id);
+  const word = await wordsRepo.findById(word_id);
   if (!word) {
     res.status(404).json({
       error: { code: 'word_not_found', message: 'Слово не найдено' },
@@ -1152,10 +1094,10 @@ router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: Authenti
     return;
   }
 
+  let newState: 'added' | 'ignored' | 'suggested' = suggestion.state;
+
   if (action === 'add') {
-    const existingUw = db.tables.user_words.find(
-      u => u.language_profile_id === profile.id && u.word_id === word_id
-    );
+    const existingUw = await userWordsRepo.findByProfileAndWord(profile.id, word_id);
 
     if (existingUw) {
       if (existingUw.status !== 'active') {
@@ -1165,62 +1107,52 @@ router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: Authenti
         return;
       }
     } else {
-      db.tables.user_words.push({
-        id: crypto.randomUUID(),
+      await userWordsRepo.create({
         language_profile_id: profile.id,
         word_id,
         status: 'active',
         stage: 0,
         due_lesson_number: lesson.lesson_number + 1,
-        last_reviewed_at: null,
         source: 'suggestion',
-        created_at: new Date().toISOString(),
       });
 
       // Link to exercise contexts with is_target = false
-      db.tables.lesson_exercise_words.push({
-        id: crypto.randomUUID(),
+      await exerciseWordsRepo.create({
         exercise_id: eid,
         word_id,
         is_target: false,
         is_new: false,
         surface_form: null,
-        result: null,
-        user_fragment: null,
         stage_before: null,
-        stage_after: null,
       });
 
-      db.recordEvent(user.id, 'new_word_accepted', { word_id, lemma: word.lemma });
+      await eventsRepo.record(user.id, 'new_word_accepted', { word_id, lemma: word.lemma });
     }
 
-    suggestion.state = 'added';
+    await suggestionsRepo.setState(suggestion.id, 'added');
+    newState = 'added';
     logger.info('LESSON', `Suggestion accepted into vocabulary`, {
       userId: user.id,
       wordId: word.id,
       lemma: word.lemma,
     });
   } else if (action === 'ignore') {
-    const existingUw = db.tables.user_words.find(
-      u => u.language_profile_id === profile.id && u.word_id === word_id
-    );
+    const existingUw = await userWordsRepo.findByProfileAndWord(profile.id, word_id);
 
     if (!existingUw) {
-      db.tables.user_words.push({
-        id: crypto.randomUUID(),
+      await userWordsRepo.create({
         language_profile_id: profile.id,
         word_id,
         status: 'ignored',
         stage: 0,
         due_lesson_number: null,
-        last_reviewed_at: null,
         source: 'suggestion',
-        created_at: new Date().toISOString(),
       });
-      db.recordEvent(user.id, 'new_word_declined', { word_id, lemma: word.lemma });
+      await eventsRepo.record(user.id, 'new_word_declined', { word_id, lemma: word.lemma });
     }
 
-    suggestion.state = 'ignored';
+    await suggestionsRepo.setState(suggestion.id, 'ignored');
+    newState = 'ignored';
     logger.info('LESSON', `Suggestion dismissed`, {
       userId: user.id,
       wordId: word.id,
@@ -1228,17 +1160,16 @@ router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: Authenti
     });
   }
 
-  db.saveSync();
-  res.json({ success: true, state: suggestion.state });
+  res.json({ success: true, state: newState });
 });
 
 // POST /lesson/exercises/:eid/report (Section 6.8)
-router.post('/exercises/:eid/report', authenticate, (req: AuthenticatedRequest, res: Response) => {
+router.post('/exercises/:eid/report', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   const { eid } = req.params;
   const { reason, comment } = req.body;
 
-  const exercise = db.tables.lesson_exercises.find(e => e.id === eid);
+  const exercise = await exercisesRepo.findById(eid);
   if (!exercise) {
     res.status(404).json({
       error: { code: 'not_found', message: 'Упражнение не найдено' },
@@ -1254,29 +1185,14 @@ router.post('/exercises/:eid/report', authenticate, (req: AuthenticatedRequest, 
     return;
   }
 
-  // Check 1 report per exercise & user (update if exists)
-  const existingReport = db.tables.sentence_reports.find(
-    r => r.user_id === user.id && r.exercise_id === eid
-  );
+  // 1 report per exercise & user (upsert)
+  await reportsRepo.upsert({
+    user_id: user.id,
+    exercise_id: eid,
+    reason,
+    comment: comment ? String(comment).substring(0, 500) : null,
+  });
 
-  if (existingReport) {
-    existingReport.reason = reason;
-    existingReport.comment = comment ? String(comment).substring(0, 500) : null;
-    existingReport.created_at = new Date().toISOString();
-  } else {
-    db.tables.sentence_reports.push({
-      id: crypto.randomUUID(),
-      user_id: user.id,
-      exercise_id: eid,
-      reason,
-      comment: comment ? String(comment).substring(0, 500) : null,
-      status: 'new',
-      admin_note: null,
-      created_at: new Date().toISOString(),
-    });
-  }
-
-  db.saveSync();
   logger.info('LESSON', `Sentence reported by user`, {
     userId: user.id,
     exerciseId: eid,
@@ -1284,7 +1200,7 @@ router.post('/exercises/:eid/report', authenticate, (req: AuthenticatedRequest, 
     comment,
   });
 
-  db.recordEvent(user.id, 'report_sent', { exercise_id: eid, reason });
+  await eventsRepo.record(user.id, 'report_sent', { exercise_id: eid, reason });
 
   res.json({ success: true });
 });

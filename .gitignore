@@ -1,0 +1,55 @@
+# ==================== SENSITIVE / SECRETS ====================
+# Environment files with real credentials (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Certificates / private keys
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+*.cert
+
+# ==================== DEPENDENCIES ====================
+node_modules/
+
+# ==================== BUILD OUTPUT ====================
+dist/
+dist-ssr/
+build/
+*.tsbuildinfo
+
+# ==================== LOGS ====================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==================== LOCAL DATA / DB DUMPS ====================
+data/
+*.sqlite
+*.db
+pgdump/
+backups/
+*.backup
+
+# ==================== OS ====================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==================== EDITORS / IDE ====================
+.idea/
+*.swp
+*.swo
+# NOTE: .vscode/ is intentionally NOT ignored — project launch/task configs are shared.
+# If you keep personal settings there, uncomment the next line instead:
+# .vscode/
+
+# ==================== MISC ====================
+.eslintcache
+coverage/

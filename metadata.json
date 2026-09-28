@@ -1,0 +1,6 @@
+{
+  "name": "КонтекстСлов - Интервальное повторение в контексте",
+  "description": "Изучение и интервальное повторение иностранных слов в осмысленных предложениях с помощью адаптивного SRS алгоритма и LLM",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

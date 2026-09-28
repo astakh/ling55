@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import {
-  profilesRepo, languagesRepo, dictionariesRepo, userWordsRepo,
+  profilesRepo, dictionariesRepo, userWordsRepo,
   lessonsRepo, exercisesRepo,
 } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
@@ -34,7 +34,6 @@ router.get('/summary', authenticate, async (req: AuthenticatedRequest, res: Resp
 
     const activeProfile = profiles.find(p => p.id === requestedProfileId) || profiles[0];
 
-    const lang = await languagesRepo.findByCode(activeProfile.target_language);
     const dict = await dictionariesRepo.findById(activeProfile.dictionary_id);
 
     const today = getLocalDateString(new Date(), user.timezone);
@@ -69,8 +68,6 @@ router.get('/summary', authenticate, async (req: AuthenticatedRequest, res: Resp
     const completedDates = await lessonsRepo.completedDatesByUser(user.id);
     const streak = calculateStreak(completedDates, today);
 
-    const languages = await languagesRepo.all();
-
     logger.info('DASHBOARD', `Dashboard summary loaded`, {
       userId: user.id,
       activeProfileId: activeProfile.id,
@@ -85,23 +82,22 @@ router.get('/summary', authenticate, async (req: AuthenticatedRequest, res: Resp
       profile: {
         id: activeProfile.id,
         target_language: activeProfile.target_language,
-        language_name: lang ? lang.name : activeProfile.target_language,
+        language_name: 'Английский',
         level: activeProfile.level,
         daily_lesson_limit: activeProfile.daily_lesson_limit,
+        words_per_lesson: activeProfile.words_per_lesson,
         last_lesson_number: activeProfile.last_lesson_number,
         dictionary: {
           id: dict ? dict.id : activeProfile.dictionary_id,
           name: dict ? dict.name : '',
+          is_general: dict ? dict.is_general : true,
         },
       },
-      profiles: profiles.map(p => {
-        const l = languages.find(langItem => langItem.code === p.target_language);
-        return {
-          id: p.id,
-          target_language: p.target_language,
-          language_name: l ? l.name : p.target_language,
-        };
-      }),
+      profiles: profiles.map(p => ({
+        id: p.id,
+        target_language: p.target_language,
+        language_name: 'Английский',
+      })),
       today,
       lessons_today: lessonsToday,
       daily_lesson_limit: activeProfile.daily_lesson_limit,

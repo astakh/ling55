@@ -1,5 +1,7 @@
 -- ============================================================================
--- SRS Context LLM — схема БД: таблицы, индексы, права, базовый seed
+-- SRS Context LLM — схема БД (упрощённая версия): таблицы, индексы, права, seed
+-- Один родной язык: русский (ru). Один изучаемый язык: английский (en).
+-- Несколько словарей: общий (general-en-ru) + тематические.
 -- PostgreSQL 13+
 -- ============================================================================
 -- Выполнять ПОСЛЕ create_database.sql, подключившись к базе srs_context
@@ -20,12 +22,12 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- Таблицы
 -- ----------------------------------------------------------------------------
 
--- Пользователи
+-- Пользователи (родной язык всегда русский)
 CREATE TABLE IF NOT EXISTS users (
     id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email                       TEXT NOT NULL UNIQUE,
     password_hash               TEXT NOT NULL,
-    native_language             TEXT NOT NULL DEFAULT 'ru',
+    native_language             TEXT NOT NULL DEFAULT 'ru' CHECK (native_language = 'ru'),
     timezone                    TEXT NOT NULL DEFAULT 'UTC',
     timezone_changed_at         TIMESTAMPTZ,
     is_onboarded                BOOLEAN NOT NULL DEFAULT FALSE,
@@ -47,21 +49,21 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user   ON refresh_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
 
--- Справочник языков
+-- Справочник языков (упрощённая версия: только ru и en)
 CREATE TABLE IF NOT EXISTS languages (
-    code         TEXT PRIMARY KEY,              -- 'en', 'de', 'es', 'fr'
+    code         TEXT PRIMARY KEY,              -- 'ru', 'en'
     name         TEXT NOT NULL,
     is_supported BOOLEAN NOT NULL DEFAULT TRUE
 );
 
--- Словари
+-- Словари (общий + тематические; пара всегда en -> ru)
 CREATE TABLE IF NOT EXISTS dictionaries (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     code            TEXT NOT NULL UNIQUE,
     name            TEXT NOT NULL,
     description     TEXT NOT NULL DEFAULT '',
-    target_language TEXT NOT NULL,
-    native_language TEXT NOT NULL,
+    target_language TEXT NOT NULL DEFAULT 'en' CHECK (target_language = 'en'),
+    native_language TEXT NOT NULL DEFAULT 'ru' CHECK (native_language = 'ru'),
     is_general      BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_dictionaries_langs ON dictionaries(target_language, native_language);
@@ -69,8 +71,8 @@ CREATE INDEX IF NOT EXISTS idx_dictionaries_langs ON dictionaries(target_languag
 -- Слова (леммы)
 CREATE TABLE IF NOT EXISTS words (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    target_language TEXT NOT NULL,
-    native_language TEXT NOT NULL,
+    target_language TEXT NOT NULL DEFAULT 'en' CHECK (target_language = 'en'),
+    native_language TEXT NOT NULL DEFAULT 'ru' CHECK (native_language = 'ru'),
     lemma           TEXT NOT NULL,
     lemma_key       TEXT NOT NULL,                      -- lower(trim(lemma)) для поиска/дедупликации
     pos             TEXT NOT NULL,                      -- noun/verb/adj/adv/pron/prep/conj/num/det/intj
@@ -87,14 +89,15 @@ CREATE TABLE IF NOT EXISTS dictionary_words (
     PRIMARY KEY (dictionary_id, word_id)
 );
 
--- Профили изучения языка пользователем
+-- Профили изучения языка пользователем (в упрощённой версии — один профиль en на пользователя)
 CREATE TABLE IF NOT EXISTS user_language_profiles (
     id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    target_language    TEXT NOT NULL,
+    target_language    TEXT NOT NULL DEFAULT 'en' CHECK (target_language = 'en'),
     level              TEXT NOT NULL CHECK (level IN ('A1','A2','B1','B2','C1','C2')),
     dictionary_id      UUID NOT NULL REFERENCES dictionaries(id),
-    daily_lesson_limit INTEGER NOT NULL DEFAULT 20 CHECK (daily_lesson_limit > 0),
+    daily_lesson_limit INTEGER NOT NULL DEFAULT 1 CHECK (daily_lesson_limit > 0),
+    words_per_lesson   INTEGER NOT NULL DEFAULT 5 CHECK (words_per_lesson > 0 AND words_per_lesson <= 20),
     last_lesson_number INTEGER NOT NULL DEFAULT 0 CHECK (last_lesson_number >= 0),
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (user_id, target_language)
@@ -241,16 +244,117 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO srs_app;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO srs_app;
 
 -- ----------------------------------------------------------------------------
--- Базовый seed: справочник языков
--- (словари и стартовые слова загружаются при первом запуске приложения
---  либо скриптом: npm run db:seed)
+-- Базовый seed: справочник языков, словари и стартовые слова общего словаря
+-- (тематические словари дополняются через админку: POST /api/admin/dictionaries/import)
 -- ----------------------------------------------------------------------------
 INSERT INTO languages (code, name, is_supported) VALUES
-    ('en', 'Английский',  TRUE),
-    ('de', 'Немецкий',    TRUE),
-    ('es', 'Испанский',   TRUE),
-    ('fr', 'Французский', TRUE)
+    ('ru', 'Русский',   TRUE),
+    ('en', 'Английский', TRUE)
 ON CONFLICT (code) DO NOTHING;
+
+-- Словари: один общий + тематические
+INSERT INTO dictionaries (code, name, description, target_language, native_language, is_general) VALUES
+    ('general-en-ru',  'Общий словарь',        'Базовая лексика по уровням A1–B2',                          'en', 'ru', TRUE),
+    ('travel-en-ru',   'Путешествия',          'Слова для аэропорта, отеля и поездок',                      'en', 'ru', FALSE),
+    ('business-en-ru', 'Бизнес и работа',      'Офисная и деловая лексика',                                 'en', 'ru', FALSE),
+    ('food-en-ru',     'Еда и рестораны',      'Продукты, блюда и заказы в кафе',                           'en', 'ru', FALSE),
+    ('tech-en-ru',     'Технологии',           'IT, гаджеты и интернет-лексика',                            'en', 'ru', FALSE)
+ON CONFLICT (code) DO NOTHING;
+
+-- Стартовые слова общего словаря (упрощённый набор A1–A2, ~50 слов).
+-- Полный словарь импортируется админом через админку (schema_version: 1).
+WITH w(lemma, pos, level, translations) AS (VALUES
+    ('time',    'noun', 'A1', ARRAY['время','раз']),
+    ('year',    'noun', 'A1', ARRAY['год']),
+    ('people',  'noun', 'A1', ARRAY['люди','народ']),
+    ('way',     'noun', 'A1', ARRAY['путь','способ','дорога']),
+    ('day',     'noun', 'A1', ARRAY['день']),
+    ('thing',   'noun', 'A1', ARRAY['вещь','дело']),
+    ('man',     'noun', 'A1', ARRAY['мужчина','человек']),
+    ('woman',   'noun', 'A1', ARRAY['женщина']),
+    ('child',   'noun', 'A1', ARRAY['ребёнок','дитя']),
+    ('world',   'noun', 'A1', ARRAY['мир']),
+    ('life',    'noun', 'A1', ARRAY['жизнь']),
+    ('hand',    'noun', 'A1', ARRAY['рука','кисть']),
+    ('part',    'noun', 'A1', ARRAY['часть']),
+    ('place',   'noun', 'A1', ARRAY['место']),
+    ('case',    'noun', 'A1', ARRAY['случай','дело','чемодан']),
+    ('week',    'noun', 'A1', ARRAY['неделя']),
+    ('company', 'noun', 'A1', ARRAY['компания','фирма']),
+    ('system',  'noun', 'A2', ARRAY['система']),
+    ('number',  'noun', 'A1', ARRAY['число','номер']),
+    ('point',   'noun', 'A2', ARRAY['точка','момент','балл']),
+    ('home',    'noun', 'A1', ARRAY['дом','домашний']),
+    ('water',   'noun', 'A1', ARRAY['вода']),
+    ('room',    'noun', 'A1', ARRAY['комната']),
+    ('area',    'noun', 'A2', ARRAY['область','площадь','зона']),
+    ('money',   'noun', 'A1', ARRAY['деньги']),
+    ('story',   'noun', 'A1', ARRAY['история','рассказ']),
+    ('month',   'noun', 'A1', ARRAY['месяц']),
+    ('lot',     'noun', 'A1', ARRAY['множество','куча']),
+    ('right',   'noun', 'A1', ARRAY['право','правильный','справа']),
+    ('house',   'noun', 'A1', ARRAY['дом','жилой дом']),
+    ('book',    'noun', 'A1', ARRAY['книга']),
+    ('night',   'noun', 'A1', ARRAY['ночь']),
+    ('word',    'noun', 'A1', ARRAY['слово']),
+    ('food',    'noun', 'A1', ARRAY['еда','пища']),
+    ('friend',  'noun', 'A1', ARRAY['друг']),
+    ('power',   'noun', 'A2', ARRAY['сила','власть','мощность']),
+    ('hour',    'noun', 'A1', ARRAY['час']),
+    ('car',     'noun', 'A1', ARRAY['машина','автомобиль']),
+    ('door',    'noun', 'A1', ARRAY['дверь']),
+    ('eye',     'noun', 'A1', ARRAY['глаз']),
+    ('be',      'verb', 'A1', ARRAY['быть']),
+    ('have',    'verb', 'A1', ARRAY['иметь']),
+    ('do',      'verb', 'A1', ARRAY['делать']),
+    ('go',      'verb', 'A1', ARRAY['идти','ехать']),
+    ('know',    'verb', 'A1', ARRAY['знать']),
+    ('want',    'verb', 'A1', ARRAY['хотеть']),
+    ('use',     'verb', 'A1', ARRAY['использовать','применять']),
+    ('work',    'verb', 'A1', ARRAY['работать','работа']),
+    ('call',    'verb', 'A1', ARRAY['звонить','называть','вызов']),
+    ('try',     'verb', 'A1', ARRAY['пытаться','пробовать']),
+    ('ask',     'verb', 'A1', ARRAY['спрашивать','просить']),
+    ('need',    'verb', 'A1', ARRAY['нуждаться','нужно']),
+    ('feel',    'verb', 'A1', ARRAY['чувствовать']),
+    ('become',  'verb', 'A2', ARRAY['становиться']),
+    ('leave',   'verb', 'A1', ARRAY['уходить','покидать','отпуск']),
+    ('put',     'verb', 'A1', ARRAY['класть','поместить']),
+    ('mean',    'verb', 'A2', ARRAY['означать']),
+    ('keep',    'verb', 'A2', ARRAY['хранить','держать']),
+    ('let',     'verb', 'A2', ARRAY['позволять','пустить']),
+    ('begin',   'verb', 'A1', ARRAY['начинать']),
+    ('speak',   'verb', 'A1', ARRAY['говорить']),
+    ('read',    'verb', 'A1', ARRAY['читать']),
+    ('write',   'verb', 'A1', ARRAY['писать']),
+    ('good',    'adj',  'A1', ARRAY['хороший']),
+    ('new',     'adj',  'A1', ARRAY['новый']),
+    ('first',   'adj',  'A1', ARRAY['первый']),
+    ('last',    'adj',  'A1', ARRAY['последний','прошлый']),
+    ('long',    'adj',  'A1', ARRAY['длинный','долгий']),
+    ('little',  'adj',  'A1', ARRAY['маленький']),
+    ('high',    'adj',  'A1', ARRAY['высокий']),
+    ('small',   'adj',  'A1', ARRAY['маленький','небольшой']),
+    ('large',   'adj',  'A1', ARRAY['большой','крупный']),
+    ('next',    'adj',  'A1', ARRAY['следующий']),
+    ('hard',    'adj',  'A2', ARRAY['трудный','жёсткий']),
+    ('important', 'adj','A2', ARRAY['важный']),
+    ('different', 'adj','A2', ARRAY['разный','другой']),
+    ('best',    'adj',  'A1', ARRAY['лучший']),
+    ('bad',     'adj',  'A1', ARRAY['плохой']),
+    ('old',     'adj',  'A1', ARRAY['старый','лет (возраст)'])
+)
+INSERT INTO words (target_language, native_language, lemma, lemma_key, pos, level, translations)
+SELECT 'en', 'ru', w.lemma, lower(w.lemma), w.pos, w.level, to_jsonb(w.translations)
+FROM w
+ON CONFLICT DO NOTHING;
+
+-- Связать все стартовые слова с общим словарём
+INSERT INTO dictionary_words (dictionary_id, word_id)
+SELECT d.id, w.id
+  FROM dictionaries d, words w
+ WHERE d.code = 'general-en-ru' AND w.target_language = 'en'
+ON CONFLICT DO NOTHING;
 
 COMMIT;
 

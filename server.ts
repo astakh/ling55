@@ -3,6 +3,7 @@ import cookieParser from 'cookie-parser';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
+import pg from 'pg';
 
 import { logger } from './server/logger.js';
 import authRoutes from './server/routes/auth.routes.js';
@@ -21,7 +22,48 @@ const __dirname = path.dirname(__filename);
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const isProduction = process.env.NODE_ENV === 'production';
 
+/**
+ * Проверка подключения к удалённому PostgreSQL (DATABASE_URL из .env).
+ * Выполняется только в dev-режиме; при ошибке сервер НЕ останавливается,
+ * но в консоль выводится предупреждение. Отключить: CHECK_DB_ON_STARTUP=false
+ */
+async function checkPostgresConnection(): Promise<void> {
+  if (process.env.CHECK_DB_ON_STARTUP === 'false') return;
+
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    logger.warn('DB', 'DATABASE_URL не задан в .env — проверка подключения к PostgreSQL пропущена');
+    return;
+  }
+
+  const client = new pg.Client({ connectionString, connectionTimeoutMillis: 8000 });
+  try {
+    await client.connect();
+    const tablesRes = await client.query(
+      "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+    );
+    const versionRes = await client.query('SHOW server_version');
+    await client.end();
+    logger.success(
+      'DB',
+      `PostgreSQL подключен: ${versionRes.rows[0].server_version}, таблиц в public: ${tablesRes.rows.length}`,
+      { tables: tablesRes.rows.map((r: any) => r.tablename).join(', ') || 'нет таблиц — выполните scripts/sql/01_schema.sql' }
+    );
+  } catch (err: any) {
+    logger.error('DB', 'Не удалось подключиться к PostgreSQL', {
+      host: (() => { try { return new URL(connectionString).host; } catch { return 'unknown'; } })(),
+      message: err.message,
+    });
+    logger.warn('DB', 'Сервер запущен без доступа к БД. Проверьте DATABASE_URL, права и сетевой доступ к серверу.');
+    try { await client.end(); } catch { /* ignore */ }
+  }
+}
+
 async function bootstrap() {
+  if (!isProduction) {
+    await checkPostgresConnection();
+  }
+
   const app = express();
 
   app.use(express.json({ limit: '15mb' }));

@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import crypto from 'crypto';
 import { db } from './db.js';
+import { logger } from './logger.js';
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -94,6 +95,15 @@ export async function generateLessonSentences(
   lessonId?: string
 ): Promise<Prompt1OutputGroup[]> {
   const startTime = Date.now();
+  logger.info('LLM', `Prompt 1: Generating sentences for ${groups.length} word groups`, {
+    targetLanguage,
+    nativeLanguage,
+    level,
+    groups: groups.map(g => ({
+      index: g.group_index,
+      lemmas: g.words.map(w => w.lemma),
+    })),
+  });
 
   const systemInstruction = `Ты лингвист-методист и составляешь учебные предложения. Для КАЖДОЙ группы слов составь ровно одно короткое, осмысленное и естественное предложение на языке ${targetLanguage} уровня ${level} по шкале CEFR.
 ПРАВИЛА:
@@ -148,19 +158,27 @@ export async function generateLessonSentences(
       try {
         const cleaned = cleanJsonText(responseText);
         parsedOutput = JSON.parse(cleaned);
+        logger.success('LLM', `Prompt 1: Gemini response received and parsed`, {
+          groupsCount: Array.isArray(parsedOutput) ? parsedOutput.length : 0,
+        });
       } catch (jsonErr) {
         status = 'invalid_json';
-        console.error('Failed to parse Gemini JSON for Prompt 1:', jsonErr, responseText);
+        logger.warn('LLM', `Prompt 1: Failed to parse Gemini JSON, will use linguistic fallback`, {
+          error: String(jsonErr),
+          raw: responseText.slice(0, 100),
+        });
       }
+    } else {
+      logger.info('LLM', `Prompt 1: No GEMINI_API_KEY set, using linguistic fallback generator`);
     }
   } catch (err: any) {
     status = 'http_error';
-    console.error('Gemini generateContent error in Prompt 1:', err);
+    logger.error('LLM', `Prompt 1: Gemini API error, falling back`, { error: err.message });
   }
 
   // Validate or fallback
   if (!parsedOutput || !Array.isArray(parsedOutput) || parsedOutput.length !== groups.length) {
-    // Generate intelligent linguistic fallback if Gemini call failed or key is missing
+    logger.info('LLM', `Prompt 1: Applying linguistic sentence synthesis for all groups`);
     parsedOutput = generateFallbackSentences(targetLanguage, nativeLanguage, groups);
   } else {
     // Validate each group matches requested lemmas
@@ -168,7 +186,7 @@ export async function generateLessonSentences(
       const expectedGroup = groups[i];
       const actual = parsedOutput.find(g => g.group_index === expectedGroup.group_index);
       if (!actual || !actual.sentence || !actual.words) {
-        // Fallback for this group
+        logger.warn('LLM', `Prompt 1: Incomplete group index ${expectedGroup.group_index}, applying fallback`);
         const fb = generateFallbackSentences(targetLanguage, nativeLanguage, [expectedGroup])[0];
         if (actual) {
           Object.assign(actual, fb);
@@ -180,6 +198,11 @@ export async function generateLessonSentences(
   }
 
   const latency = Date.now() - startTime;
+  logger.info('LLM', `Prompt 1 completed`, {
+    status,
+    latencyMs: latency,
+    sentences: parsedOutput.map(p => p.sentence),
+  });
   db.recordLlmCall({
     purpose: 'generate',
     user_id: userId || null,
@@ -215,6 +238,12 @@ export async function evaluateTranslation(
   const startTime = Date.now();
   const tokenDelimiter = `<<<UT_${crypto.randomBytes(4).toString('hex')}>>>`;
   const sanitizedUserText = userTranslation.replace(/<{3,}|>{3,}/g, '').trim().substring(0, 500);
+
+  logger.info('LLM', `Prompt 2: Evaluating user translation`, {
+    targetSentence,
+    userTranslation: sanitizedUserText || '(empty/dont_know)',
+    targetWords: targetWords.map(tw => tw.lemma),
+  });
 
   const allowedPos = ['noun', 'verb', 'adj', 'adv', 'pron', 'prep', 'conj', 'num', 'det', 'intj'];
 
@@ -258,14 +287,22 @@ new_suggested_words: до 3 слов из целевого предложени�
       try {
         const cleaned = cleanJsonText(responseText);
         parsedOutput = JSON.parse(cleaned);
+        logger.success('LLM', `Prompt 2: Gemini evaluation received and parsed`, {
+          evaluations: parsedOutput?.evaluations?.map(e => `${e.word_id}:${e.result}`),
+        });
       } catch (jsonErr) {
         status = 'invalid_json';
-        console.error('Failed to parse Gemini evaluation JSON:', jsonErr, responseText);
+        logger.warn('LLM', `Prompt 2: Failed to parse Gemini evaluation JSON, falling back to algorithmic evaluation`, {
+          error: String(jsonErr),
+          raw: responseText.slice(0, 100),
+        });
       }
+    } else {
+      logger.info('LLM', `Prompt 2: No GEMINI_API_KEY set, using algorithmic evaluation fallback`);
     }
   } catch (err: any) {
     status = 'http_error';
-    console.error('Gemini evaluate error:', err);
+    logger.error('LLM', `Prompt 2: Gemini evaluate error, falling back`, { error: err.message });
   }
 
   // Validate or run algorithmic fallback evaluation
@@ -286,6 +323,11 @@ new_suggested_words: до 3 слов из целевого предложени�
   }
 
   const latency = Date.now() - startTime;
+  logger.info('LLM', `Prompt 2 completed`, {
+    latencyMs: latency,
+    evaluations: parsedOutput.evaluations.map(e => ({ word_id: e.word_id, result: e.result, fragment: e.user_fragment })),
+    suggestedWords: parsedOutput.new_suggested_words.map(s => s.lemma),
+  });
   db.recordLlmCall({
     purpose: 'evaluate',
     user_id: userId || null,
@@ -398,41 +440,54 @@ function generateFallbackSentences(
   groups: Prompt1GroupInput[]
 ): Prompt1OutputGroup[] {
   return groups.map(g => {
-    const wordsDesc = g.words.map(w => w.lemma).join(', ');
+    const lemmas = g.words.map(w => w.lemma);
+    let sentence = '';
+    let reference_translation = '';
+
     if (targetLanguage === 'en') {
-      const sentence = `I always remember to read a good book with my friend.`;
-      return {
-        group_index: g.group_index,
-        sentence: `We can ${g.words[0]?.lemma || 'learn'} every day in our ${g.words[1]?.lemma || 'house'}.`,
-        reference_translation: `Мы можем изучать каждый день в нашем доме.`,
-        words: g.words.map(w => ({
-          lemma: w.lemma,
-          pos: w.pos,
-          surface_form: w.lemma,
-        })),
-      };
+      if (lemmas.length === 1) {
+        sentence = `We can definitely use ${lemmas[0]} in our daily practice.`;
+        reference_translation = `Мы определенно можем использовать ${lemmas[0]} в нашей ежедневной практике.`;
+      } else if (lemmas.length === 2) {
+        sentence = `It is important to remember ${lemmas[0]} and understand ${lemmas[1]}.`;
+        reference_translation = `Важно помнить ${lemmas[0]} и понимать ${lemmas[1]}.`;
+      } else {
+        sentence = `Together we explore ${lemmas[0]}, observe ${lemmas[1]}, and discuss ${lemmas[2] || 'it'}.`;
+        reference_translation = `Вместе мы исследуем ${lemmas[0]}, наблюдаем ${lemmas[1]} и обсуждаем ${lemmas[2] || 'это'}.`;
+      }
     } else if (targetLanguage === 'de') {
-      return {
-        group_index: g.group_index,
-        sentence: `Wir können im ${g.words[0]?.lemma || 'Haus'} ein Buch ${g.words[1]?.lemma || 'lesen'}.`,
-        reference_translation: `Мы можем читать книгу в доме.`,
-        words: g.words.map(w => ({
-          lemma: w.lemma,
-          pos: w.pos,
-          surface_form: w.lemma,
-        })),
-      };
+      if (lemmas.length === 1) {
+        sentence = `Wir möchten ${lemmas[0]} heute zusammen lernen.`;
+        reference_translation = `Мы хотим учить ${lemmas[0]} сегодня вместе.`;
+      } else if (lemmas.length === 2) {
+        sentence = `Im Alltag nutzen wir ${lemmas[0]} und ${lemmas[1]} regelmäßig.`;
+        reference_translation = `В повседневной жизни мы регулярно используем ${lemmas[0]} и ${lemmas[1]}.`;
+      } else {
+        sentence = `Hier sehen wir ${lemmas[0]}, ${lemmas[1]} und ${lemmas[2] || 'alles'} im Text.`;
+        reference_translation = `Здесь мы видим ${lemmas[0]}, ${lemmas[1]} и ${lemmas[2] || 'все'} в тексте.`;
+      }
     } else {
-      return {
-        group_index: g.group_index,
-        sentence: `Vamos a ${g.words[0]?.lemma || 'leer'} en la ${g.words[1]?.lemma || 'casa'}.`,
-        reference_translation: `Мы собираемся читать в доме.`,
-        words: g.words.map(w => ({
-          lemma: w.lemma,
-          pos: w.pos,
-          surface_form: w.lemma,
-        })),
-      };
+      if (lemmas.length === 1) {
+        sentence = `Podemos practicar ${lemmas[0]} todos los días.`;
+        reference_translation = `Мы можем практиковать ${lemmas[0]} каждый день.`;
+      } else if (lemmas.length === 2) {
+        sentence = `Es bueno conocer ${lemmas[0]} y recordar ${lemmas[1]}.`;
+        reference_translation = `Хорошо знать ${lemmas[0]} и помнить ${lemmas[1]}.`;
+      } else {
+        sentence = `Hoy estudiamos ${lemmas[0]}, ${lemmas[1]} y ${lemmas[2] || 'más'} en clase.`;
+        reference_translation = `Сегодня мы изучаем ${lemmas[0]}, ${lemmas[1]} и ${lemmas[2] || 'другое'} на уроке.`;
+      }
     }
+
+    return {
+      group_index: g.group_index,
+      sentence,
+      reference_translation,
+      words: g.words.map(w => ({
+        lemma: w.lemma,
+        pos: w.pos,
+        surface_form: w.lemma,
+      })),
+    };
   });
 }

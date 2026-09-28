@@ -2,6 +2,8 @@
  * Algorithm 5.6: Streak calculation across all language profiles.
  */
 
+import { logger } from './logger.js';
+
 export interface StreakResult {
   current: number;
   longest: number;
@@ -26,11 +28,25 @@ export function getLocalDateString(date: Date, timezone: string): string {
 export function getMidnightResetUtc(timezone: string): string {
   try {
     const now = new Date();
-    // Next day midnight in user timezone
-    const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-    const tomorrowStr = getLocalDateString(tomorrow, timezone);
-    // Parse tomorrow 00:00:00 in timezone
-    const resetDate = new Date(`${tomorrowStr}T00:00:00Z`);
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: 'numeric',
+      second: 'numeric',
+      hour12: false,
+    });
+    const parts = formatter.formatToParts(now);
+    const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10);
+    const minute = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
+    const second = parseInt(parts.find(p => p.type === 'second')?.value || '0', 10);
+
+    const secondsSinceTzMidnight = (hour % 24) * 3600 + minute * 60 + second;
+    const secondsUntilTzMidnight = 86400 - secondsSinceTzMidnight;
+
+    const resetDate = new Date(now.getTime() + secondsUntilTzMidnight * 1000);
     return resetDate.toISOString();
   } catch (e) {
     const now = new Date();

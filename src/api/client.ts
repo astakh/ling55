@@ -59,6 +59,15 @@ export async function apiRequest<T = any>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
+  const method = options.method || 'GET';
+  const startTime = performance.now();
+  console.log(
+    `%c[CLIENT REQUEST]%c ${method} /api${endpoint}`,
+    'color: #0ea5e9; font-weight: bold;',
+    'color: inherit;',
+    options.body ? (typeof options.body === 'string' ? JSON.parse(options.body) : options.body) : ''
+  );
+
   const headers = new Headers(options.headers || {});
   if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
@@ -75,16 +84,18 @@ export async function apiRequest<T = any>(
 
   // Handle 401 token refresh
   if (response.status === 401 && !endpoint.startsWith('/auth/')) {
+    console.warn(`[CLIENT AUTH] Access token expired, attempting silent refresh...`);
     if (!isRefreshing) {
       isRefreshing = true;
       const newToken = await refreshAccessToken();
       isRefreshing = false;
       if (newToken) {
+        console.log(`[CLIENT AUTH] Token refreshed successfully`);
         onRefreshed(newToken);
         headers.set('Authorization', `Bearer ${newToken}`);
         response = await fetch(`/api${endpoint}`, { ...options, headers });
       } else {
-        // Dispatch logout event if needed
+        console.warn(`[CLIENT AUTH] Refresh failed, session ended`);
         window.dispatchEvent(new Event('auth:logout'));
       }
     } else {
@@ -98,10 +109,17 @@ export async function apiRequest<T = any>(
     }
   }
 
+  const duration = Math.round(performance.now() - startTime);
   const data = await response.json().catch(() => null);
 
   if (!response.ok) {
     const errObj = data?.error || {};
+    console.error(
+      `%c[CLIENT ERROR]%c ${method} /api${endpoint} (${response.status}) in ${duration}ms:`,
+      'color: #ef4444; font-weight: bold;',
+      'color: inherit;',
+      errObj
+    );
     throw new ApiError(
       response.status,
       errObj.code || 'unknown_error',
@@ -109,6 +127,13 @@ export async function apiRequest<T = any>(
       errObj.details
     );
   }
+
+  console.log(
+    `%c[CLIENT SUCCESS]%c ${method} /api${endpoint} (${response.status}) in ${duration}ms`,
+    'color: #10b981; font-weight: bold;',
+    'color: inherit;',
+    data
+  );
 
   return data as T;
 }

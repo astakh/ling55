@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import crypto from 'crypto';
 import { db } from '../db.js';
 import { authenticate, requireAdmin, AuthenticatedRequest, hashPassword, revokeAllUserTokens } from '../auth.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 
@@ -194,6 +195,15 @@ router.post('/dictionaries/import', authenticate, requireAdmin, (req: Authentica
     });
   }
 
+  logger.info('ADMIN', `Dictionary import finished: "${name}" (${code})`, {
+    adminId: user.id,
+    dryRun,
+    added,
+    linked,
+    skipped,
+    errors,
+  });
+
   res.json({
     dictionary: {
       code,
@@ -262,6 +272,12 @@ router.patch('/reports/:id', authenticate, requireAdmin, (req: AuthenticatedRequ
   }
 
   db.saveSync();
+  logger.info('ADMIN', `Report updated: ${report.id}`, {
+    adminId: req.user!.id,
+    newStatus: report.status,
+    adminNote: report.admin_note,
+  });
+
   res.json({ report });
 });
 
@@ -301,6 +317,11 @@ router.post('/users/:id/reset-password', authenticate, requireAdmin, async (req:
   user.password_hash = await hashPassword(temporaryPassword);
   revokeAllUserTokens(user.id);
   db.saveSync();
+
+  logger.warn('ADMIN', `Admin reset password for user: ${user.email}`, {
+    adminId: req.user!.id,
+    targetUserId: user.id,
+  });
 
   res.json({
     success: true,

@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { db } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { getLocalDateString, getMidnightResetUtc, calculateStreak } from '../streak.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 
@@ -11,6 +12,7 @@ router.patch('/timezone', authenticate, (req: AuthenticatedRequest, res: Respons
   const { timezone } = req.body;
 
   if (!timezone) {
+    logger.warn('SETTINGS', 'Timezone update rejected: missing timezone', { userId: user.id });
     res.status(422).json({
       error: { code: 'validation_error', message: 'Часовой пояс обязателен' },
     });
@@ -21,6 +23,7 @@ router.patch('/timezone', authenticate, (req: AuthenticatedRequest, res: Respons
   try {
     Intl.DateTimeFormat(undefined, { timeZone: timezone });
   } catch (e) {
+    logger.warn('SETTINGS', 'Timezone update rejected: invalid IANA timezone', { userId: user.id, timezone });
     res.status(422).json({
       error: { code: 'invalid_timezone', message: 'Некорректный формат IANA часового пояса' },
     });
@@ -45,6 +48,8 @@ router.patch('/timezone', authenticate, (req: AuthenticatedRequest, res: Respons
       .map(l => l.completed_local_date!);
     const streak = calculateStreak(completedDates, today);
 
+    logger.info('SETTINGS', 'Timezone unchanged (idempotent)', { userId: user.id, timezone });
+
     res.json({
       timezone: user.timezone,
       today,
@@ -62,6 +67,7 @@ router.patch('/timezone', authenticate, (req: AuthenticatedRequest, res: Respons
     const diff = Date.now() - lastChange;
     if (diff < sevenDaysMs) {
       const availableAt = new Date(lastChange + sevenDaysMs).toISOString();
+      logger.warn('SETTINGS', 'Timezone update rejected: 7-day cooldown', { userId: user.id, availableAt });
       res.status(409).json({
         error: {
           code: 'timezone_change_too_soon',
@@ -73,6 +79,7 @@ router.patch('/timezone', authenticate, (req: AuthenticatedRequest, res: Respons
     }
   }
 
+  const oldTz = user.timezone;
   user.timezone = timezone;
   user.timezone_changed_at = new Date().toISOString();
   db.save();
@@ -93,6 +100,12 @@ router.patch('/timezone', authenticate, (req: AuthenticatedRequest, res: Respons
     })
     .map(l => l.completed_local_date!);
   const streak = calculateStreak(completedDates, today);
+
+  logger.info('SETTINGS', `Timezone changed: ${oldTz} -> ${timezone}`, {
+    userId: user.id,
+    newToday: today,
+    streakCurrent: streak.current,
+  });
 
   res.json({
     timezone: user.timezone,

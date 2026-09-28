@@ -5,6 +5,7 @@ import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { updateSrs } from '../srs.js';
 import { generateLessonSentences, evaluateTranslation, TargetWordEvalInput } from '../llm.js';
 import { getLocalDateString, getMidnightResetUtc, calculateStreak } from '../streak.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 const WORDS_PER_LESSON = parseInt(process.env.WORDS_PER_LESSON || '5', 10);
@@ -159,6 +160,7 @@ router.post('/preview', authenticate, (req: AuthenticatedRequest, res: Response)
 
   const profileId = language_profile_id || user.active_language_profile_id;
   if (!profileId) {
+    logger.warn('LESSON', 'Preview request missing language profile', { userId: user.id });
     res.status(422).json({
       error: { code: 'missing_profile', message: 'Не указан языковой профиль' },
     });
@@ -167,11 +169,21 @@ router.post('/preview', authenticate, (req: AuthenticatedRequest, res: Response)
 
   const preview = computePreview(profileId, user.id, user.timezone);
   if (preview.error === 'not_found') {
+    logger.warn('LESSON', 'Preview request: profile not found', { userId: user.id, profileId });
     res.status(403).json({
       error: { code: 'forbidden', message: 'Профиль не найден или недоступен' },
     });
     return;
   }
+
+  logger.info('LESSON', `Preview computed`, {
+    userId: user.id,
+    profileId,
+    state: preview.state,
+    lessonNumber: (preview as any).lesson_number,
+    dueCount: (preview as any).due_words?.length || 0,
+    newCount: (preview as any).new_words?.length || 0,
+  });
 
   res.json(preview);
 });
@@ -181,8 +193,16 @@ router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: 
   const user = req.user!;
   const { language_profile_id, word_id } = req.body;
 
+  if (!word_id) {
+    res.status(422).json({
+      error: { code: 'missing_word_id', message: 'Не указан ID слова' },
+    });
+    return;
+  }
+
+  const profileId = language_profile_id || user.active_language_profile_id;
   const profile = db.tables.user_language_profiles.find(
-    p => p.id === language_profile_id && p.user_id === user.id
+    p => p.id === profileId && p.user_id === user.id
   );
   if (!profile) {
     res.status(403).json({
@@ -238,6 +258,13 @@ router.post('/new-word/decline', authenticate, (req: AuthenticatedRequest, res: 
     db.recordEvent(user.id, 'new_word_declined', { word_id, lemma: word.lemma });
   }
 
+  logger.info('LESSON', `New word declined`, {
+    userId: user.id,
+    profileId: profile.id,
+    wordId: word.id,
+    lemma: word.lemma,
+  });
+
   const updatedPreview = computePreview(profile.id, user.id, user.timezone);
   res.json(updatedPreview);
 });
@@ -247,10 +274,20 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
   const user = req.user!;
   const { language_profile_id, word_ids } = req.body;
 
+  if (!Array.isArray(word_ids) || word_ids.length === 0) {
+    logger.warn('LESSON', 'Start lesson rejected: empty or invalid word_ids', { userId: user.id });
+    res.status(422).json({
+      error: { code: 'empty_words', message: 'Список слов пуст или некорректен' },
+    });
+    return;
+  }
+
+  const profileId = language_profile_id || user.active_language_profile_id;
   const profile = db.tables.user_language_profiles.find(
-    p => p.id === language_profile_id && p.user_id === user.id
+    p => p.id === profileId && p.user_id === user.id
   );
   if (!profile) {
+    logger.warn('LESSON', 'Start lesson rejected: forbidden profile', { userId: user.id, profileId });
     res.status(403).json({
       error: { code: 'forbidden', message: 'Профиль не принадлежит пользователю' },
     });
@@ -262,6 +299,10 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
     l => l.language_profile_id === profile.id && l.status === 'in_progress'
   );
   if (inProgress) {
+    logger.warn('LESSON', 'Start lesson rejected: lesson already in progress', {
+      userId: user.id,
+      lessonId: inProgress.id,
+    });
     res.status(409).json({
       error: { code: 'resume_available', message: 'У вас уже есть незавершенный урок' },
     });
@@ -275,6 +316,11 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
   ).length;
 
   if (lessonsToday >= profile.daily_lesson_limit) {
+    logger.warn('LESSON', 'Start lesson rejected: daily limit reached', {
+      userId: user.id,
+      lessonsToday,
+      limit: profile.daily_lesson_limit,
+    });
     res.status(409).json({
       error: { code: 'limit_reached', message: 'Дневной лимит уроков исчерпан' },
     });
@@ -283,6 +329,7 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
 
   // Advisory lock
   if (!db.tryLockProfile(profile.id)) {
+    logger.warn('LESSON', 'Start lesson rejected: lock busy', { profileId: profile.id });
     res.status(409).json({
       error: { code: 'start_in_progress', message: 'Урок уже формируется' },
     });
@@ -299,14 +346,23 @@ router.post('/start', authenticate, async (req: AuthenticatedRequest, res: Respo
 
     if (wordsList.length === 0) {
       db.unlockProfile(profile.id);
+      logger.warn('LESSON', 'Start lesson rejected: words not found in dictionary', { word_ids });
       res.status(422).json({
-        error: { code: 'empty_words', message: 'Список слов пуст' },
+        error: { code: 'empty_words', message: 'Слова не найдены в словаре' },
       });
       return;
     }
 
     const nextLessonNumber = profile.last_lesson_number + 1;
     const N = wordsList.length;
+
+    logger.info('LESSON', `Starting lesson #${nextLessonNumber}`, {
+      userId: user.id,
+      targetLanguage: profile.target_language,
+      level: profile.level,
+      totalWords: N,
+      lemmas: wordsList.map(w => w.lemma),
+    });
 
     // Cluster into k = ceil(N / 3) groups
     // Sizes differ by at most 1, smaller groups first.
@@ -498,8 +554,17 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
   const user = req.user!;
   const { exercise_id, user_translation, dont_know } = req.body;
 
+  if (!exercise_id) {
+    logger.warn('LESSON', 'Evaluation rejected: missing exercise_id', { userId: user.id });
+    res.status(422).json({
+      error: { code: 'missing_exercise_id', message: 'Не указан ID упражнения' },
+    });
+    return;
+  }
+
   const exercise = db.tables.lesson_exercises.find(e => e.id === exercise_id);
   if (!exercise) {
+    logger.warn('LESSON', 'Evaluation rejected: exercise not found', { exercise_id });
     res.status(404).json({
       error: { code: 'exercise_not_found', message: 'Упражнение не найдено' },
     });
@@ -526,6 +591,7 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
 
   // Idempotency: if already evaluated, return saved result
   if (exercise.status === 'evaluated') {
+    logger.info('LESSON', 'Evaluation returned from cache (idempotent)', { exerciseId: exercise.id });
     const exerciseWords = db.tables.lesson_exercise_words.filter(
       ew => ew.exercise_id === exercise.id && ew.is_target
     );
@@ -613,7 +679,10 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
   const isDontKnow = Boolean(dont_know);
 
   if (isDontKnow) {
-    // "Не знаю" branch
+    logger.info('LESSON', `Exercise answered with "Не знаю" (skipped LLM call)`, {
+      exerciseId: exercise.id,
+      targetWords: targetWordsInput.map(t => t.lemma),
+    });
     evalResult = {
       evaluations: targetWordsInput.map(tw => ({
         word_id: tw.word_id,
@@ -638,7 +707,7 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
         exercise.id
       );
     } catch (err: any) {
-      console.error('LLM evaluation error:', err);
+      logger.error('LESSON', 'LLM evaluation error', { error: err.message });
       res.status(503).json({
         error: { code: 'llm_unavailable', message: 'Сервер перегружен, попробуйте ещё раз' },
       });
@@ -743,6 +812,11 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
     lesson.completed_local_date = getLocalDateString(new Date(), user.timezone);
     lessonCompleted = true;
 
+    logger.success('LESSON', `Lesson #${lesson.lesson_number} auto-completed!`, {
+      lessonId: lesson.id,
+      completedLocalDate: lesson.completed_local_date,
+    });
+
     db.recordEvent(user.id, 'lesson_completed', {
       lesson_id: lesson.id,
       lesson_number: lesson.lesson_number,
@@ -754,6 +828,15 @@ router.post('/evaluate', authenticate, async (req: AuthenticatedRequest, res: Re
     exercise_id: exercise.id,
     lesson_id: lesson.id,
     dont_know: isDontKnow,
+  });
+
+  logger.info('LESSON', `Exercise evaluated`, {
+    exerciseId: exercise.id,
+    orderIndex: exercise.order_index,
+    dontKnow: isDontKnow,
+    results: formattedWordsResponse.map(w => `${w.lemma}:${w.result}`),
+    suggestionsCount: allowedSuggestions.length,
+    lessonCompleted,
   });
 
   res.json({
@@ -772,6 +855,7 @@ router.get('/:id/current', authenticate, (req: AuthenticatedRequest, res: Respon
   const user = req.user!;
   const lesson = db.tables.lessons.find(l => l.id === req.params.id);
   if (!lesson) {
+    logger.warn('LESSON', 'Current exercise request: lesson not found', { lessonId: req.params.id });
     res.status(404).json({
       error: { code: 'not_found', message: 'Урок не найден' },
     });
@@ -796,11 +880,19 @@ router.get('/:id/current', authenticate, (req: AuthenticatedRequest, res: Respon
   const currentPending = exercises.find(e => e.status === 'pending');
 
   if (!currentPending) {
+    logger.info('LESSON', 'All exercises already evaluated for lesson', { lessonId: lesson.id });
     res.status(409).json({
       error: { code: 'lesson_not_active', message: 'Все упражнения уже завершены' },
     });
     return;
   }
+
+  logger.info('LESSON', `Resuming lesson #${lesson.lesson_number}`, {
+    lessonId: lesson.id,
+    currentExerciseIndex: currentPending.order_index,
+    doneCount,
+    totalCount: exercises.length,
+  });
 
   res.json({
     exercise_id: currentPending.id,
@@ -874,6 +966,14 @@ router.get('/:id/summary', authenticate, (req: AuthenticatedRequest, res: Respon
   ).sort((a, b) => new Date(a.completed_at!).getTime() - new Date(b.completed_at!).getTime());
 
   const extendedToday = lessonsOnSameDate.length > 0 && lessonsOnSameDate[0].id === lesson.id;
+
+  logger.info('LESSON', `Summary fetched for lesson #${lesson.lesson_number}`, {
+    lessonId: lesson.id,
+    withoutErrors,
+    totalWords: exerciseWords.length,
+    streakCurrent: streak.current,
+    extendedToday,
+  });
 
   res.json({
     lesson_number: lesson.lesson_number,
@@ -996,6 +1096,11 @@ router.post('/:id/abandon', authenticate, (req: AuthenticatedRequest, res: Respo
   lesson.abandoned_at = new Date().toISOString();
   db.saveSync();
 
+  logger.warn('LESSON', `Lesson #${lesson.lesson_number} abandoned by user`, {
+    userId: user.id,
+    lessonId: lesson.id,
+  });
+
   db.recordEvent(user.id, 'lesson_abandoned', {
     lesson_id: lesson.id,
     lesson_number: lesson.lesson_number,
@@ -1090,6 +1195,11 @@ router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: Authenti
     }
 
     suggestion.state = 'added';
+    logger.info('LESSON', `Suggestion accepted into vocabulary`, {
+      userId: user.id,
+      wordId: word.id,
+      lemma: word.lemma,
+    });
   } else if (action === 'ignore') {
     const existingUw = db.tables.user_words.find(
       u => u.language_profile_id === profile.id && u.word_id === word_id
@@ -1111,6 +1221,11 @@ router.post('/exercises/:eid/suggestions/:word_id', authenticate, (req: Authenti
     }
 
     suggestion.state = 'ignored';
+    logger.info('LESSON', `Suggestion dismissed`, {
+      userId: user.id,
+      wordId: word.id,
+      lemma: word.lemma,
+    });
   }
 
   db.saveSync();
@@ -1162,6 +1277,13 @@ router.post('/exercises/:eid/report', authenticate, (req: AuthenticatedRequest, 
   }
 
   db.saveSync();
+  logger.info('LESSON', `Sentence reported by user`, {
+    userId: user.id,
+    exerciseId: eid,
+    reason,
+    comment,
+  });
+
   db.recordEvent(user.id, 'report_sent', { exercise_id: eid, reason });
 
   res.json({ success: true });

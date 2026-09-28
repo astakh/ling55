@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import crypto from 'crypto';
 import { db } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 const DAILY_LESSON_LIMIT_MAX = parseInt(process.env.DAILY_LESSON_LIMIT_MAX || '5', 10);
@@ -54,6 +55,7 @@ router.post('/language-profiles', authenticate, (req: AuthenticatedRequest, res:
     p => p.user_id === user.id && p.target_language === target_language
   );
   if (existing) {
+    logger.warn('LANGUAGES', 'Attempt to add already studied language', { target_language, userId: user.id });
     res.status(409).json({
       error: { code: 'already_exists', message: 'Этот язык уже изучается' },
     });
@@ -94,6 +96,12 @@ router.post('/language-profiles', authenticate, (req: AuthenticatedRequest, res:
   db.tables.user_language_profiles.push(newProfile);
   user.active_language_profile_id = newProfile.id;
   db.save();
+
+  logger.success('LANGUAGES', `New language profile added: ${target_language} (${level})`, {
+    userId: user.id,
+    profileId: newProfile.id,
+    dictionaryId: chosenDict.id,
+  });
 
   db.recordEvent(user.id, 'language_added', { target_language, level });
 
@@ -215,6 +223,14 @@ router.patch('/language-profiles/:id', authenticate, (req: AuthenticatedRequest,
   }
 
   db.save();
+  logger.info('LANGUAGES', `Language profile updated`, {
+    userId: user.id,
+    profileId: profile.id,
+    level: profile.level,
+    dictionaryId: profile.dictionary_id,
+    dailyLimit: profile.daily_lesson_limit,
+  });
+
   res.json({ profile });
 });
 
@@ -254,6 +270,7 @@ router.put('/me/active-language', authenticate, (req: AuthenticatedRequest, res:
   );
 
   if (!profile) {
+    logger.warn('LANGUAGES', 'Switch active profile failed: not found', { userId: user.id, language_profile_id });
     res.status(404).json({
       error: { code: 'profile_not_found', message: 'Профиль не найден' },
     });
@@ -262,6 +279,11 @@ router.put('/me/active-language', authenticate, (req: AuthenticatedRequest, res:
 
   user.active_language_profile_id = profile.id;
   db.save();
+
+  logger.info('LANGUAGES', `Active language switched to ${profile.target_language} (profile: ${profile.id})`, {
+    userId: user.id,
+    targetLanguage: profile.target_language,
+  });
 
   res.json({ success: true, active_language_profile_id: profile.id });
 });

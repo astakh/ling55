@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import { db } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 
@@ -17,6 +18,7 @@ router.get('/list', authenticate, (req: AuthenticatedRequest, res: Response) => 
     p => p.id === profileId && p.user_id === user.id
   );
   if (!profile) {
+    logger.warn('VOCABULARY', 'Vocabulary list request: profile not found', { userId: user.id, profileId });
     res.status(404).json({
       error: { code: 'profile_not_found', message: 'Профиль не найден' },
     });
@@ -76,6 +78,15 @@ router.get('/list', authenticate, (req: AuthenticatedRequest, res: Response) => 
   const totalPages = Math.ceil(total / pageSize);
   const startIndex = (page - 1) * pageSize;
   const paginated = items.slice(startIndex, startIndex + pageSize);
+
+  logger.info('VOCABULARY', 'Vocabulary list retrieved', {
+    userId: user.id,
+    profileId,
+    statusFilter: statusFilter || 'all',
+    searchQuery: searchQuery || undefined,
+    page,
+    total,
+  });
 
   res.json({
     items: paginated,
@@ -145,6 +156,15 @@ router.get('/word/:id', authenticate, (req: AuthenticatedRequest, res: Response)
     dueInLessons = Math.max(uw.due_lesson_number - profile.last_lesson_number, 0);
   }
 
+  logger.info('VOCABULARY', `Word details fetched: "${word.lemma}"`, {
+    userId: user.id,
+    profileId,
+    wordId: word.id,
+    status: uw.status,
+    stage: uw.stage,
+    historyOccurrences: history.length,
+  });
+
   res.json({
     word_id: word.id,
     lemma: word.lemma,
@@ -186,11 +206,15 @@ router.patch('/word/:id/status', authenticate, (req: AuthenticatedRequest, res: 
     return;
   }
 
+  const word = db.tables.words.find(w => w.id === wordId);
+
   // Idempotent check
   if (uw.status === status) {
     res.json({ success: true, status: uw.status, stage: uw.stage });
     return;
   }
+
+  const oldStatus = uw.status;
 
   // Transitions:
   // active -> ignored
@@ -211,6 +235,16 @@ router.patch('/word/:id/status', authenticate, (req: AuthenticatedRequest, res: 
   }
 
   db.saveSync();
+  logger.info('VOCABULARY', `Word status changed: ${oldStatus} -> ${status}`, {
+    userId: user.id,
+    profileId,
+    wordId,
+    lemma: word?.lemma,
+    newStatus: uw.status,
+    newStage: uw.stage,
+    dueLessonNumber: uw.due_lesson_number,
+  });
+
   res.json({ success: true, status: uw.status, stage: uw.stage, due_lesson_number: uw.due_lesson_number });
 });
 

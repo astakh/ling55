@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import crypto from 'crypto';
 import { db } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 
@@ -22,6 +23,11 @@ router.get('/pairs', (req, res: Response) => {
     };
   });
 
+  logger.info('ONBOARDING', `Language pairs retrieved for native language "${native}"`, {
+    pairsCount: supportedTargets.length,
+    languages: supportedTargets.map(p => p.code),
+  });
+
   res.json({
     native_language: native,
     pairs: supportedTargets,
@@ -32,6 +38,7 @@ router.get('/pairs', (req, res: Response) => {
 router.post('/complete', authenticate, (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
   if (user.is_onboarded) {
+    logger.warn('ONBOARDING', 'User attempted duplicate onboarding', { userId: user.id });
     res.status(409).json({
       error: { code: 'already_onboarded', message: 'Онбординг уже пройден' },
     });
@@ -41,6 +48,7 @@ router.post('/complete', authenticate, (req: AuthenticatedRequest, res: Response
   const { native_language, timezone, target_language, level } = req.body;
 
   if (!native_language || !target_language || !level) {
+    logger.warn('ONBOARDING', 'Onboarding validation failed: missing fields', { userId: user.id, body: req.body });
     res.status(422).json({
       error: { code: 'validation_error', message: 'Все поля обязательны' },
     });
@@ -68,6 +76,7 @@ router.post('/complete', authenticate, (req: AuthenticatedRequest, res: Response
   );
 
   if (!generalDict) {
+    logger.warn('ONBOARDING', 'No general dictionary for language pair', { native_language, target_language });
     res.status(422).json({
       error: { code: 'pair_not_supported', message: 'Для данной пары языков нет общего словаря' },
     });
@@ -98,6 +107,15 @@ router.post('/complete', authenticate, (req: AuthenticatedRequest, res: Response
   user.is_onboarded = true;
   user.active_language_profile_id = profileId;
   db.save();
+
+  logger.success('ONBOARDING', `Onboarding completed successfully!`, {
+    userId: user.id,
+    email: user.email,
+    targetLanguage: target_language,
+    level,
+    timezone: tz,
+    dictionaryId: generalDict.id,
+  });
 
   db.recordEvent(user.id, 'onboarding_completed', {
     target_language,

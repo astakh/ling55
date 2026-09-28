@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 
+import { logger } from './server/logger.js';
 import authRoutes from './server/routes/auth.routes.js';
 import onboardingRoutes from './server/routes/onboarding.routes.js';
 import languagesRoutes from './server/routes/languages.routes.js';
@@ -25,6 +26,37 @@ async function bootstrap() {
 
   app.use(express.json({ limit: '15mb' }));
   app.use(cookieParser());
+
+  // Global HTTP Request Logging Middleware
+  app.use((req, res, next) => {
+    if (req.path.startsWith('/api') && req.path !== '/api/health') {
+      const startTime = Date.now();
+      const method = req.method;
+      const url = req.originalUrl || req.url;
+
+      res.on('finish', () => {
+        const duration = Date.now() - startTime;
+        const status = res.statusCode;
+        const details: Record<string, any> = {
+          status,
+          duration: `${duration}ms`,
+        };
+        if (req.body && Object.keys(req.body).length > 0) {
+          // Avoid logging password in plain text
+          const sanitizedBody = { ...req.body };
+          if (sanitizedBody.password) sanitizedBody.password = '***';
+          details.body = sanitizedBody;
+        }
+
+        if (status >= 400) {
+          logger.warn('HTTP', `${method} ${url}`, details);
+        } else {
+          logger.info('HTTP', `${method} ${url}`, details);
+        }
+      });
+    }
+    next();
+  });
 
   // API Routes
   app.use('/api/auth', authRoutes);

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { db } from '../db.js';
+import { logger } from '../logger.js';
 import {
   hashPassword,
   comparePassword,
@@ -19,6 +20,7 @@ const router = Router();
 router.post('/register', async (req: Request, res: Response) => {
   const { email, password } = req.body;
   if (!email || !password) {
+    logger.warn('AUTH', 'Registration failed - missing credentials');
     res.status(422).json({
       error: { code: 'validation_error', message: 'Email и пароль обязательны' },
     });
@@ -28,6 +30,7 @@ router.post('/register', async (req: Request, res: Response) => {
   const cleanEmail = String(email).trim().toLowerCase();
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!emailRegex.test(cleanEmail)) {
+    logger.warn('AUTH', 'Registration failed - invalid email format', { email: cleanEmail });
     res.status(422).json({
       error: { code: 'invalid_email', message: 'Некорректный формат email' },
     });
@@ -35,6 +38,7 @@ router.post('/register', async (req: Request, res: Response) => {
   }
 
   if (password.length < 8 || password.length > 72) {
+    logger.warn('AUTH', 'Registration failed - invalid password length');
     res.status(422).json({
       error: { code: 'invalid_password', message: 'Пароль должен быть от 8 до 72 символов' },
     });
@@ -43,6 +47,7 @@ router.post('/register', async (req: Request, res: Response) => {
 
   const existing = db.tables.users.find(u => u.email === cleanEmail);
   if (existing) {
+    logger.warn('AUTH', 'Registration conflict - email already registered', { email: cleanEmail });
     res.status(409).json({
       error: { code: 'email_taken', message: 'Этот email уже зарегистрирован' },
     });
@@ -68,6 +73,12 @@ router.post('/register', async (req: Request, res: Response) => {
   db.tables.users.push(newUser);
   db.save();
   db.recordEvent(newUser.id, 'signup', { email: cleanEmail });
+
+  logger.success('AUTH', 'User registered successfully', {
+    userId: newUser.id,
+    email: newUser.email,
+    isAdmin: newUser.is_admin,
+  });
 
   const { token: refreshToken } = createRefreshToken(newUser.id);
   setRefreshTokenCookie(res, refreshToken);
@@ -96,6 +107,7 @@ router.post('/register', async (req: Request, res: Response) => {
 router.post('/login', async (req: Request, res: Response) => {
   const { email, password } = req.body;
   if (!email || !password) {
+    logger.warn('AUTH', 'Login failed - missing credentials');
     res.status(401).json({
       error: { code: 'invalid_credentials', message: 'Неверный email или пароль' },
     });
@@ -105,6 +117,7 @@ router.post('/login', async (req: Request, res: Response) => {
   const cleanEmail = String(email).trim().toLowerCase();
   const user = db.tables.users.find(u => u.email === cleanEmail);
   if (!user) {
+    logger.warn('AUTH', 'Login failed - user not found', { email: cleanEmail });
     res.status(401).json({
       error: { code: 'invalid_credentials', message: 'Неверный email или пароль' },
     });
@@ -113,6 +126,7 @@ router.post('/login', async (req: Request, res: Response) => {
 
   const isValid = await comparePassword(password, user.password_hash);
   if (!isValid) {
+    logger.warn('AUTH', 'Login failed - invalid password', { email: cleanEmail });
     res.status(401).json({
       error: { code: 'invalid_credentials', message: 'Неверный email или пароль' },
     });
@@ -126,6 +140,11 @@ router.post('/login', async (req: Request, res: Response) => {
     userId: user.id,
     email: user.email,
     isAdmin: user.is_admin,
+  });
+
+  logger.success('AUTH', 'User logged in', {
+    userId: user.id,
+    email: user.email,
   });
 
   res.json({
@@ -146,6 +165,7 @@ router.post('/login', async (req: Request, res: Response) => {
 router.post('/refresh', (req: Request, res: Response) => {
   const oldRefreshToken = req.cookies?.refreshToken || req.body?.refresh_token;
   if (!oldRefreshToken) {
+    logger.debug('AUTH', 'Refresh failed - no token provided');
     res.status(401).json({
       error: { code: 'unauthorized', message: 'Отсутствует refresh token' },
     });
@@ -154,6 +174,7 @@ router.post('/refresh', (req: Request, res: Response) => {
 
   const rotation = rotateRefreshToken(oldRefreshToken);
   if (!rotation) {
+    logger.warn('AUTH', 'Refresh failed - token expired or revoked');
     res.clearCookie('refreshToken');
     res.status(401).json({
       error: { code: 'unauthorized', message: 'Сессия истекла или токен отозван' },
@@ -161,6 +182,7 @@ router.post('/refresh', (req: Request, res: Response) => {
     return;
   }
 
+  logger.info('AUTH', 'Token refreshed successfully', { userId: rotation.user.id });
   setRefreshTokenCookie(res, rotation.newRefreshToken);
   res.json({
     access_token: rotation.accessToken,
@@ -181,6 +203,7 @@ router.post('/logout', (req: Request, res: Response) => {
   const token = req.cookies?.refreshToken;
   if (token) {
     revokeRefreshToken(token);
+    logger.info('AUTH', 'User logged out and token revoked');
   }
   res.clearCookie('refreshToken');
   res.json({ success: true });
@@ -189,6 +212,7 @@ router.post('/logout', (req: Request, res: Response) => {
 // GET /me
 router.get('/me', authenticate, (req: AuthenticatedRequest, res: Response) => {
   const user = req.user!;
+  logger.debug('AUTH', 'Current user session verified', { userId: user.id });
   res.json({
     user: {
       id: user.id,

@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { db } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { getLocalDateString, calculateStreak } from '../streak.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 
@@ -91,6 +92,15 @@ router.get('/stats', authenticate, (req: AuthenticatedRequest, res: Response) =>
     mastered: allUserWords.filter(w => w.status === 'mastered').length,
     ignored: allUserWords.filter(w => w.status === 'ignored').length,
   };
+
+  logger.info('PROFILE', `Profile stats loaded`, {
+    userId: user.id,
+    streakCurrent: streak.current,
+    streakLongest: streak.longest,
+    accuracyAllTime: `${accuracyAllTime}%`,
+    accuracy30d: `${accuracy30d}%`,
+    completedLessons: completedLessons.length,
+  });
 
   res.json({
     streak,

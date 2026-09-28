@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { db } from '../db.js';
 import { authenticate, AuthenticatedRequest } from '../auth.js';
 import { getLocalDateString, getMidnightResetUtc, calculateStreak } from '../streak.js';
+import { logger } from '../logger.js';
 
 const router = Router();
 
@@ -10,6 +11,7 @@ router.get('/summary', authenticate, (req: AuthenticatedRequest, res: Response) 
   const user = req.user!;
 
   if (!user.is_onboarded) {
+    logger.warn('DASHBOARD', 'Summary requested by non-onboarded user', { userId: user.id });
     res.status(403).json({
       error: { code: 'not_onboarded', message: 'Онбординг не завершен' },
     });
@@ -81,6 +83,16 @@ router.get('/summary', authenticate, (req: AuthenticatedRequest, res: Response) 
     .map(l => l.completed_local_date!);
 
   const streak = calculateStreak(completedDates, today);
+
+  logger.info('DASHBOARD', `Dashboard summary loaded`, {
+    userId: user.id,
+    activeProfileId: activeProfile.id,
+    targetLanguage: activeProfile.target_language,
+    cta,
+    streakCurrent: streak.current,
+    wordsActive: wordsSummary.active,
+    wordsMastered: wordsSummary.mastered,
+  });
 
   res.json({
     profile: {
